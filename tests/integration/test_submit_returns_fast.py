@@ -231,3 +231,95 @@ def test_llm_failure_surfaces_as_thought_and_does_not_crash_run(app, monkeypatch
 
     notes = asyncio.run(_go())
     assert notes, f"expected at least one error/fallback note; got {notes}"
+
+
+def test_sse_stream_emits_thinking_events(app):
+    """When the LLM returns a `reasoning` payload (M3-thinking variant),
+    the agent loop must surface it as `kind=thinking` agent_thought
+    events so the UI can render the chain-of-thought trace."""
+    from holmes_swarm.llm.base import ChatResponse
+
+    transport = httpx.ASGITransport(app=app)
+
+    class _ThinkingLLM:
+        async def chat(self, messages, **kwargs):
+            # First call returns chain-of-thought + empty content.
+            return ChatResponse(
+                text="",
+                reasoning=(
+                    "Verifying the procedure volume against the SOAT cap.\n"
+                    "Querying the local RAG for the reference tariff.\n"
+                    "Conclusion: monthly volume exceeds the threshold."
+                ),
+            )
+
+    app.state.llm.chat = _ThinkingLLM().chat  # type: ignore[attr-defined]
+    for a in app.state.registry.all():
+        if hasattr(a, "llm") and a.llm is not None:
+            a.llm = app.state.llm
+
+    async def _go():
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post(
+                "/chat",
+                json={"message": "Investiga fraude con whatsapp de la clínica x", "auto_submit": True},
+                headers={"Authorization": "Bearer demo-token-esteban"},
+            )
+            data = r.json()
+            rid = data["request_id"]
+            stream_url = f"/investigations/{rid}/stream?token=demo-token-esteban"
+            thinking_lines: list[str] = []
+            async with c.stream("GET", stream_url) as resp:
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:"):
+                        line = line[len("data:"):].strip()
+                        if not line or line == "{}":
+                            continue
+                        import json
+                        try:
+                            evt = json.loads(line)
+                        except Exception:
+                            continue
+                        if evt.get("kind") == "agent_thought":
+                            payload = evt.get("payload") or {}
+                            if payload.get("kind") == "thinking":
+                                thinking_lines.append(payload.get("message") or "")
+                        if evt.get("kind") == "completed":
+                            break
+            return thinking_lines
+
+    lines = asyncio.run(_go())
+    assert lines, "no kind=thinking events were emitted"
+    assert any("SOAT" in l or "Verifying" in l for l in lines), f"unexpected thinking lines: {lines}"
+
+
+def test_ui_assets_served_with_no_cache_headers_and_cache_buster(app):
+    """The HTML index must reference JS/CSS with a per-file `?v=<mtime>`
+    cache-buster AND the response headers must disable browser caching.
+    Without this, every UI fix is invisible until the user does a hard
+    reload (Cmd+Shift+R)."""
+    transport = httpx.ASGITransport(app=app)
+
+    async def _go():
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            # 1. HTML index has cache-buster.
+            r = await c.get("/")
+            assert r.status_code == 200
+            assert "no-store" in r.headers.get("cache-control", "").lower()
+            body = r.text
+            assert "/ui/styles.css?v=" in body, f"no cache-buster on styles.css; body={body[:600]}"
+            assert "/ui/app.js?v=" in body, f"no cache-buster on app.js; body={body[:600]}"
+
+            # 2. JS/CSS assets themselves carry no-cache headers.
+            for path in ("/ui/styles.css", "/ui/app.js"):
+                r2 = await c.get(path)
+                assert r2.status_code == 200, f"{path} returned {r2.status_code}"
+                assert "no-store" in r2.headers.get("cache-control", "").lower(), (
+                    f"{path} missing no-store: {dict(r2.headers)}"
+                )
+
+            # 3. The cache-buster URL still resolves (no path mismatch).
+            r3 = await c.get("/ui/styles.css?v=12345")
+            assert r3.status_code == 200
+
+    asyncio.run(_go())

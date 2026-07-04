@@ -68,22 +68,26 @@ function appendMessage(role, text, meta) {
 }
 
 function appendEventLog(evt) {
-  // Manage the per-agent filter pills: every distinct agent_id seen on the
-  // wire gets a chip. Click to scope the log to a single agent.
+  // Manage the per-agent filter tabs: every distinct agent_id seen on the
+  // wire gets a tab with the agent's accent colour. Click to scope the log
+  // to a single agent.
   if (evt.agent_id && !eventFilterEl.querySelector(`[data-filter="${evt.agent_id}"]`)) {
-    const pill = document.createElement('button');
-    pill.type = 'button';
-    pill.className = 'filter-pill';
-    pill.dataset.filter = evt.agent_id;
-    pill.textContent = evt.agent_id;
-    pill.addEventListener('click', () => setEventFilter(evt.agent_id));
-    eventFilterEl.appendChild(pill);
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = `filter-tab agent-${agentSlug(evt.agent_id)}`;
+    tab.dataset.filter = evt.agent_id;
+    tab.textContent = evt.agent_id;
+    tab.addEventListener('click', () => setEventFilter(evt.agent_id));
+    eventFilterEl.appendChild(tab);
   }
   const li = document.createElement('li');
   li.className = evt.kind;
   li.dataset.agentId = evt.agent_id || '';
+  if (evt.agent_id) li.classList.add(`agent-${agentSlug(evt.agent_id)}`);
   const ts = new Date(evt.at || Date.now()).toLocaleTimeString();
-  li.innerHTML = `<span class="ts">${ts}</span><span class="kind">${evt.kind}</span><span>${evt.agent_id || ''} ${summarisePayload(evt.payload)}</span>`;
+  li.innerHTML = `<span class="ts">${ts}</span><span class="kind">${evt.kind}</span>${
+    evt.agent_id ? `<span class="agent-tag">${evt.agent_id}</span>` : ''
+  }<span class="payload">${summarisePayload(evt.payload)}</span>`;
   allEventRows.unshift({ evt, li });
   while (allEventRows.length > 300) {
     const removed = allEventRows.pop();
@@ -96,6 +100,11 @@ function appendEventLog(evt) {
   }
 }
 
+function agentSlug(id) {
+  // CSS-safe suffix used for per-agent colour classes.
+  return String(id || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '-');
+}
+
 function rowMatchesFilter(evt) {
   if (activeEventFilter === 'all') return true;
   return (evt.agent_id || '') === activeEventFilter;
@@ -103,7 +112,7 @@ function rowMatchesFilter(evt) {
 
 function setEventFilter(filter) {
   activeEventFilter = filter;
-  for (const btn of eventFilterEl.querySelectorAll('.filter-pill')) {
+  for (const btn of eventFilterEl.querySelectorAll('.filter-tab')) {
     btn.classList.toggle('active', btn.dataset.filter === filter);
   }
   // Re-render the visible list from cache (no SSE roundtrip).
@@ -115,15 +124,15 @@ function setEventFilter(filter) {
   }
 }
 
-// Reset the live event log + filter chips at the start of each investigation.
+// Reset the live event log + filter tabs at the start of each investigation.
 function resetEventLog() {
   allEventRows = [];
   eventLogEl.innerHTML = '';
   activeEventFilter = 'all';
-  for (const btn of eventFilterEl.querySelectorAll('.filter-pill')) {
+  for (const btn of eventFilterEl.querySelectorAll('.filter-tab')) {
     if (btn.dataset.filter !== 'all') btn.remove();
   }
-  for (const btn of eventFilterEl.querySelectorAll('.filter-pill')) {
+  for (const btn of eventFilterEl.querySelectorAll('.filter-tab')) {
     btn.classList.toggle('active', btn.dataset.filter === 'all');
   }
 }
@@ -193,6 +202,7 @@ function agentPanel(agentId, displayName) {
       <span class="dot"></span>
       <span class="name">${displayName || agentId}</span>
       <span class="role">${agentId}</span>
+      <span class="llm-pill" hidden></span>
       <span class="state-pill">esperando</span>
     </header>
     <div class="transcript" aria-live="polite"></div>
@@ -337,8 +347,16 @@ function handleStreamEvent(evt) {
     case 'agent_started': {
       const name = evt.payload.agent_name || evt.agent_id;
       setAgentState(evt.agent_id, 'running');
-      agentPanel(evt.agent_id, name);
+      const panel = agentPanel(evt.agent_id, name);
       setAgentPanelState(evt.agent_id, 'running');
+      // Show which LLM is reasoning (and whether the thinking variant is on).
+      const llmPill = panel.querySelector('.llm-pill');
+      if (llmPill && evt.payload.llm_model) {
+        const think = evt.payload.llm_thinking ? ' · 💭 thinking' : '';
+        llmPill.textContent = `${evt.payload.llm_model}${think}`;
+        llmPill.hidden = false;
+        llmPill.classList.toggle('thinking-on', !!evt.payload.llm_thinking);
+      }
       appendAgentThought(evt.agent_id, name, { kind: 'start', message: `▶ ${name} (${evt.payload.signal_type}) — umbral ${(evt.payload.confidence_threshold * 100).toFixed(0)}%` });
       break;
     }

@@ -198,6 +198,20 @@ button.ghost:hover { background: var(--bg-3); }
   background: var(--bg); color: var(--fg-muted);
   text-transform: uppercase; letter-spacing: 0.4px;
 }
+.agent-thought .llm-pill {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(88,166,255,0.10);
+  color: var(--accent-2);
+  border: 1px solid rgba(88,166,255,0.30);
+}
+.agent-thought .llm-pill.thinking-on {
+  background: rgba(188,140,255,0.15);
+  color: #d2a8ff;
+  border-color: rgba(188,140,255,0.40);
+}
 .agent-thought.idle .state-pill { color: var(--fg-muted); }
 .agent-thought.running { border-color: rgba(88,166,255,0.35); }
 .agent-thought.running .state-pill { background: rgba(88,166,255,0.18); color: var(--accent); }
@@ -261,6 +275,17 @@ button.ghost:hover { background: var(--bg-3); }
   background: rgba(248,81,73,0.12);
   font-weight: 600;
 }
+/* Chain-of-thought from the M3-thinking variant. */
+.agent-thought .thought.kind-thinking .bubble {
+  border-color: rgba(188,140,255,0.55);
+  background: rgba(188,140,255,0.08);
+  font-style: italic;
+  color: #d2a8ff;
+}
+.agent-thought .thought.kind-thinking .bubble::before {
+  content: "💭 ";
+  font-style: normal;
+}
 .agent-thought .bubble code {
   background: rgba(255,255,255,0.05);
   padding: 1px 4px; border-radius: 3px;
@@ -278,15 +303,51 @@ button.ghost:hover { background: var(--bg-3); }
   display: flex; gap: 6px; align-items: baseline;
 }
 .event-log li .ts { color: var(--fg-muted); }
-.event-log li .kind { color: var(--accent-2); min-width: 80px; }
+.event-log li {
+  padding: 4px 6px; border-radius: 4px; margin-bottom: 2px;
+  display: grid; grid-template-columns: 64px 110px auto 1fr; gap: 6px;
+  align-items: baseline;
+  border-left: 3px solid transparent;
+}
+.event-log li .ts { color: var(--fg-muted); font-size: 10px; }
+.event-log li .kind { color: var(--accent-2); font-size: 11px; }
+.event-log li .agent-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  color: var(--fg-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-transform: lowercase;
+  border: 1px solid var(--border);
+}
+.event-log li .payload { font-size: 11px; word-break: break-word; }
 .event-log li.signal { background: rgba(88,166,255,0.08); }
 .event-log li.completed { background: rgba(63,185,80,0.08); }
 .event-log li.failed { background: rgba(248,81,73,0.08); }
+.event-log li.agent_thought { background: rgba(255,255,255,0.02); }
+.event-log li.agent_started { border-left-color: var(--accent); }
+.event-log li.agent_completed { border-left-color: var(--good); }
+.event-log li.agent_failed { border-left-color: var(--bad); }
+.event-log li.agent_thought { border-left-color: rgba(255,255,255,0.18); }
 
-.event-filter {
+/* Per-agent colours used as a left border + agent-tag tint. */
+.event-log li.agent-medical { border-left-color: #58a6ff; }
+.event-log li.agent-medical .agent-tag { background: rgba(88,166,255,0.18); color: #79c0ff; border-color: rgba(88,166,255,0.35); }
+.event-log li.agent-logistics { border-left-color: #3fb950; }
+.event-log li.agent-logistics .agent-tag { background: rgba(63,185,80,0.18); color: #56d364; border-color: rgba(63,185,80,0.35); }
+.event-log li.agent-contracting { border-left-color: #d29922; }
+.event-log li.agent-contracting .agent-tag { background: rgba(210,153,34,0.18); color: #e3b341; border-color: rgba(210,153,34,0.35); }
+.event-log li.agent-whistleblower { border-left-color: #bc8cff; }
+.event-log li.agent-whistleblower .agent-tag { background: rgba(188,140,255,0.18); color: #d2a8ff; border-color: rgba(188,140,255,0.35); }
+
+/* Tabs that scope the log to a single agent. The button element selector
+   earlier in the file paints every <button> blue; we use #event-filter to
+   boost specificity and override cleanly. */
+#event-filter.event-filter {
   display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px;
 }
-.filter-pill {
+#event-filter .filter-tab {
   background: var(--bg-3);
   color: var(--fg-muted);
   border: 1px solid var(--border);
@@ -297,12 +358,25 @@ button.ghost:hover { background: var(--bg-3); }
   cursor: pointer;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   text-transform: lowercase;
+  margin: 0;
 }
-.filter-pill:hover { color: var(--fg); border-color: var(--accent); }
-.filter-pill.active {
+#event-filter .filter-tab:hover { color: var(--fg); border-color: var(--accent); }
+#event-filter .filter-tab.active {
   background: rgba(88,166,255,0.18);
   border-color: var(--accent);
   color: var(--accent);
+}
+#event-filter .filter-tab.agent-medical.active {
+  background: rgba(88,166,255,0.22); border-color: #58a6ff; color: #79c0ff;
+}
+#event-filter .filter-tab.agent-logistics.active {
+  background: rgba(63,185,80,0.22); border-color: #3fb950; color: #56d364;
+}
+#event-filter .filter-tab.agent-contracting.active {
+  background: rgba(210,153,34,0.22); border-color: #d29922; color: #e3b341;
+}
+#event-filter .filter-tab.agent-whistleblower.active {
+  background: rgba(188,140,255,0.22); border-color: #bc8cff; color: #d2a8ff;
 }
 
 @media (max-width: 900px) {

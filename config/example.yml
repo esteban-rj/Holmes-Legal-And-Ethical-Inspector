@@ -1,7 +1,17 @@
 llm:
   provider: mock          # change to "minimax" to use the real provider
   model: MiniMax-M3
-  api_base: https://api.minimax.example/v1
+  # `thinking` is kept on the client for forward-compatibility with
+  # providers that expose a separate thinking model variant. The `minimax`
+  # provider exposes a single chat-completions model id (`MiniMax-M3`)
+  # and rejects 400 on any `-thinking` suffix or on
+  # `reasoning_effort` / `thinking` body fields, so we always invoke the
+  # base model id and never forward those flags.
+  thinking: true
+  # Override the thinking model id when your provider exposes a different
+  # name (defaults to `${model}-thinking`). Has no effect on `minimax`.
+  thinking_model: null
+  api_base: https://api.minimax.io/v1
   api_key_env: MINIMAX_API_KEY
 
 agents:

@@ -9,13 +9,17 @@ System prompt enforces:
   moderation-API or a curated PQR-glossary host) and the LLM decides whether
   to consult it.
 
-When the LLM is missing or returns no signals, the regex fall-through on
-known modus operandi patterns still applies, preserving back-compat.
+The LLM is the only judge. If the LLM is unavailable or returns a verdict
+without ``modus_operandi`` (or returns one that falls outside the allow-list),
+the agent raises :class:`AgentUnavailableError` rather than silently filling
+the gap with a regex extractor on raw PQR text. The modus-operandi allow-list
+itself is surfaced inside the system prompt so the LLM can use it explicitly.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -23,13 +27,23 @@ from ..blackboard.schema import InvestigationScope, Signal
 from ..llm.base import ChatResponse, LLMClient, Message, ToolSpec
 from ._runtime import make_signal
 from ._tools import fetch_url_tool
-from .base import AgentRuntimeContext
+from .base import AgentRuntimeContext, AgentUnavailableError
 
-_MODUS_PATTERNS = [
-    r"whatsapp", r"telegram", r"mensajer[íi]a instant[áa]nea",
-    r"auxiliares?", r"comisi[óo]n", r"soborno", r"coima", r"facturas? falsas?",
-    r"cartel", r"colusi[óo]n",
-]
+_log = logging.getLogger(__name__)
+
+
+_ALLOWED_MODUS = {
+    "whatsapp",
+    "telegram",
+    "mensajeria_instantanea",
+    "auxiliares",
+    "comision",
+    "soborno",
+    "coima",
+    "facturas_falsas",
+    "cartel",
+    "colusion",
+}
 
 
 class WhistleblowerAgent:
@@ -92,6 +106,11 @@ class WhistleblowerAgent:
         signals: list[Signal] = []
         pqrs = batch.get("pqrs", []) or []
         llm = (ctx.llm if ctx else None) or self.llm
+        if llm is None:
+            raise AgentUnavailableError(
+                f"agent={self.id} has no LLM configured; cannot reason about PQRs"
+            )
+        sink = getattr(ctx, "thought_sink", None) if ctx else None
 
         for pqr in pqrs:
             text = pqr.get("body") or pqr.get("text") or ""
@@ -104,66 +123,59 @@ class WhistleblowerAgent:
             if not text or not entity_id:
                 continue
 
-            sink = getattr(ctx, "thought_sink", None) if ctx else None
             if sink is not None:
                 await sink.emit(
                     "note",
                     {"message": f"Analizando PQR «{pqr.get('id', '?')}» — {pqr.get('channel', 'pqr')}"},
                 )
+                await sink.emit(
+                    "note",
+                    {"message": "Pidiendo al LLM un veredicto sobre la queja…"},
+                )
 
-            verdict: dict[str, Any] = {}
-            if llm is not None:
+            try:
+                verdict = await _ask_llm_for_verdict(llm, self.system_prompt(), text)
+            except AgentUnavailableError:
+                raise
+            except Exception as exc:
+                _log.error(
+                    "agent.unavailable",
+                    extra={
+                        "agent": self.id,
+                        "model": getattr(llm, "active_model", None),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "reason": "llm_call_failed",
+                    },
+                )
                 if sink is not None:
-                    await sink.emit(
-                        "note",
-                        {"message": "Pidiendo al LLM un veredicto sobre la queja…"},
-                    )
-                try:
-                    verdict = await _ask_llm_for_verdict(llm, self.system_prompt(), text)
-                except Exception as exc:
-                    if sink is not None:
+                    try:
                         await sink.emit(
-                            "note",
+                            "error",
                             {
+                                "agent": self.name,
+                                "reason": "llm_unavailable",
+                                "error_type": type(exc).__name__,
                                 "message": (
-                                    f"LLM no disponible ({type(exc).__name__}: {exc}); "
-                                    "se usará heurística regex."
-                                )
+                                    f"LLM no disponible ({type(exc).__name__}: {exc}). "
+                                    "Sin LLM funcional no se emiten veredictos."
+                                ),
                             },
                         )
-                    verdict = {}
-
-            if not verdict.get("modus_operandi"):
-                # Grep-based fallback when the LLM declined or returned empty.
-                hits = []
-                for pat in _MODUS_PATTERNS:
-                    if re.search(pat, text, re.IGNORECASE):
-                        hits.append(_canonical(pat))
-                # Always merge regex hits into the verdict so downstream sees them.
-                if not verdict:
-                    sentiment = _fallback_sentiment(text)
-                    verdict = {"sentiment": sentiment, "entities": [], "modus_operandi": hits}
-                else:
-                    verdict["modus_operandi"] = hits
-                    verdict.setdefault("sentiment", _fallback_sentiment(text))
-
-            if not verdict.get("modus_operandi"):
-                # Grep-based fallback when the LLM declined or returned empty.
-                hits = []
-                for pat in _MODUS_PATTERNS:
-                    if re.search(pat, text, re.IGNORECASE):
-                        hits.append(_canonical(pat))
-                # Always merge regex hits into the verdict so downstream sees them.
-                if not verdict:
-                    sentiment = _fallback_sentiment(text)
-                    verdict = {"sentiment": sentiment, "entities": [], "modus_operandi": hits}
-                else:
-                    verdict["modus_operandi"] = hits
-                    verdict.setdefault("sentiment", _fallback_sentiment(text))
+                    except Exception:
+                        pass
+                raise AgentUnavailableError(
+                    f"whistleblower agent: LLM call failed ({type(exc).__name__}): {exc}"
+                ) from exc
 
             modus = verdict.get("modus_operandi") or []
             if not modus:
+                # The LLM is the judge — an empty/unallow-listed modus_operandi
+                # is a real verdict ("nothing suspicious"), NOT a reason to
+                # silently regex-grep the PQR body. The LLM may still choose
+                # to emit 0 signals for the whole batch; that is fine.
                 continue
+
             confidence = 0.7 if verdict.get("sentiment") == "negative" else 0.55
             signals.append(
                 make_signal(
@@ -175,7 +187,7 @@ class WhistleblowerAgent:
                         "pqr_id": pqr.get("id"),
                         "sentiment": verdict.get("sentiment", "neutral"),
                         "modus_operandi": modus,
-                        "reasoning_source": "llm" if llm is not None else "regex_fallback",
+                        "reasoning_source": "llm",
                     },
                     scope=scope,
                     confidence_threshold=self.confidence_threshold,
@@ -192,44 +204,6 @@ class WhistleblowerAgent:
 
 
 # ---------- pure helpers ----------
-
-
-_ALLOWED_MODUS = {
-    "whatsapp",
-    "telegram",
-    "mensajeria_instantanea",
-    "auxiliares",
-    "comision",
-    "soborno",
-    "coima",
-    "facturas_falsas",
-    "cartel",
-    "colusion",
-}
-
-
-def _canonical(pattern: str) -> str:
-    base = re.sub(r"[\\?+*]", "", pattern).rstrip("\\")
-    return {
-        "whatsapp": "whatsapp",
-        "telegram": "telegram",
-        "mensajería instantánea": "mensajeria_instantanea",
-        "mensajeria instantanea": "mensajeria_instantanea",
-        "mensajer[íi]a instant[áa]nea": "mensajeria_instantanea",
-        "auxiliares?": "auxiliares",
-        "auxiliares": "auxiliares",
-        "comisión": "comision",
-        "comision": "comision",
-        "comisi[óo]n": "comision",
-        "soborno": "soborno",
-        "coima": "coima",
-        "facturas? falsas?": "facturas_falsas",
-        "facturas falsas": "facturas_falsas",
-        "cartel": "cartel",
-        "colusión": "colusion",
-        "colusion": "colusion",
-        "colusi[óo]n": "colusion",
-    }.get(base, base)
 
 
 def _sanitise_modus(raw: Any) -> list[str]:
@@ -251,13 +225,6 @@ def _sanitise_modus(raw: Any) -> list[str]:
     return out
 
 
-def _fallback_sentiment(text: str) -> str:
-    t = text.lower()
-    if any(w in t for w in ["fraude", "irregular", "corrup", "cobro", "amenaza"]):
-        return "negative"
-    return "neutral"
-
-
 async def _ask_llm_for_verdict(llm: LLMClient, system_prompt: str, body: str) -> dict[str, Any]:
     """Send the PQR body through the LLM and parse a strict JSON verdict.
 
@@ -272,7 +239,9 @@ async def _ask_llm_for_verdict(llm: LLMClient, system_prompt: str, body: str) ->
     try:
         resp: ChatResponse = await llm.chat(messages, tools=[])
     except Exception:
-        return {}
+        # Re-raise so the caller can surface the failure; we never silently
+        # fall back to a coded regex extractor.
+        raise
     text = (resp.text or "").strip()
     # Strip ```json fences if present.
     fence = re.match(r"```(?:json)?\s*([\s\S]+?)```", text, re.IGNORECASE)
@@ -286,9 +255,21 @@ async def _ask_llm_for_verdict(llm: LLMClient, system_prompt: str, body: str) ->
     try:
         obj = json.loads(text)
     except json.JSONDecodeError:
-        return {}
+        # Surface the first 200 chars of the model output (no PQR body — that
+        # lives in `body` arg, not in the verdict text) so future debugging
+        # doesn't have to reproduce the failure blind.
+        preview = (resp.text or "").strip().replace("\n", " ")[:200]
+        _log.error(
+            "agent.whistleblower.non_json",
+            extra={"preview": preview, "model": getattr(llm, "active_model", None)},
+        )
+        raise AgentUnavailableError(
+            "whistleblower agent: LLM returned non-JSON verdict"
+        ) from None
     if not isinstance(obj, dict):
-        return {}
+        raise AgentUnavailableError(
+            "whistleblower agent: LLM returned a non-object verdict"
+        )
     return {
         "sentiment": str(obj.get("sentiment", "neutral")),
         "entities": [str(e) for e in (obj.get("entities") or []) if isinstance(e, (str, int))],

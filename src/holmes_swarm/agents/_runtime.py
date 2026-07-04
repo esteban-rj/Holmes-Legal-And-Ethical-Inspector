@@ -114,7 +114,10 @@ def user_batch_message(*, system_prompt: str, batch: Any, scope: Any) -> list[Me
 def parse_verdict(text: str) -> list[dict[str, Any]]:
     """Extract a JSON `{"signals":[...]}` verdict from an LLM reply.
 
-    Tolerant: handles ```json fenced blocks and embedded JSON.
+    Tolerant: handles ```json fenced blocks and embedded JSON. Also tolerant
+    to the verdict being a *list* of signals at the top level (some models
+    forget the wrapping `{"signals": [...]}` envelope) and to extra prose
+    around the JSON object.
     """
     import json
     import re
@@ -124,17 +127,21 @@ def parse_verdict(text: str) -> list[dict[str, Any]]:
     # Try fenced block first.
     fence = re.search(r"```(?:json)?\s*([\s\S]+?)```", text, re.IGNORECASE)
     candidate = fence.group(1) if fence else text
-    # Try the whole string, then progressively wider sub-strings.
     candidates = [candidate.strip()]
-    for i, line in enumerate(candidate.splitlines()):
+    for line in candidate.splitlines():
         stripped = line.strip()
         if stripped.startswith("{") and stripped.endswith("}"):
             candidates.append(stripped)
     body = "".join(candidates[0].splitlines())
-    try:
-        obj = json.loads(body)
-    except json.JSONDecodeError:
-        # Last-ditch: regex for the first {...} blob.
+    obj: Any = None
+    for c in [body, text]:
+        try:
+            obj = json.loads(c)
+            break
+        except json.JSONDecodeError:
+            continue
+    if obj is None:
+        # Last-ditch: regex for the first balanced {...} blob.
         m = re.search(r"\{[\s\S]*\}", text)
         if not m:
             return []
@@ -142,6 +149,8 @@ def parse_verdict(text: str) -> list[dict[str, Any]]:
             obj = json.loads(m.group(0))
         except json.JSONDecodeError:
             return []
+    if isinstance(obj, list):
+        return [s for s in obj if isinstance(s, dict)]
     if not isinstance(obj, dict):
         return []
     sigs = obj.get("signals")

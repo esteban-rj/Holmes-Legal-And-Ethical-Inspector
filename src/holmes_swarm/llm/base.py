@@ -58,6 +58,11 @@ class ChatResponse:
     text: str
     raw: dict[str, Any] = field(default_factory=dict)
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # Chain-of-thought / reasoning tokens from the thinking variant of the
+    # model (e.g. MiniMax-M3-thinking). Empty for non-thinking models. The
+    # agent loop surfaces this verbatim as `kind=thinking` thoughts so the
+    # UI can render the reasoning trace per agent.
+    reasoning: str = ""
 
 
 class LLMClient(Protocol):
@@ -331,6 +336,17 @@ async def run_with_tool_loop(
                 tool_calls=last_resp.tool_calls or None,
             )
         )
+        # Surface the chain-of-thought separately so the UI can render it
+        # as a distinct "thinking" thought. The thinking variant of the
+        # model returns the rationale in `ChatResponse.reasoning`.
+        if last_resp.reasoning:
+            await sink.emit(
+                "thinking",
+                {
+                    "step": step,
+                    "text": last_resp.reasoning,
+                },
+            )
         # Surface this LLM step (text reasoning + tool-calls it wants to make).
         await sink.emit(
             "llm_step",

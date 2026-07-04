@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ..agents.base import AgentRuntimeContext
+from ..agents.base import AgentRuntimeContext, AgentUnavailableError
 from ..agents.registry import AgentRegistry
 from ..blackboard.queue_bus import QueueBus
 from ..blackboard.schema import AuditLogEntry, PublishRejected, Signal
@@ -235,6 +235,11 @@ class InvestigationService:
                     "agent_name": agent.name,
                     "signal_type": agent.signal_type,
                     "confidence_threshold": agent.confidence_threshold,
+                    # Surface which LLM is actually reasoning for this agent,
+                    # including whether the thinking variant is active. Lets
+                    # the UI confirm in real time that M3-thinking is in use.
+                    "llm_model": getattr(self.llm, "active_model", None),
+                    "llm_thinking": bool(getattr(self.llm, "thinking", False)),
                 },
             )
 
@@ -282,14 +287,19 @@ class InvestigationService:
             except Exception as exc:
                 # Surface the LLM/network failure as a thought so the UI can
                 # show what went wrong (otherwise the user just sees a red
-                # `agent_failed` line with no context). The agent still moves
-                # to the deterministic fallback if its run() returned [].
+                # `agent_failed` line with no context). `AgentUnavailableError`
+                # is the contract for "this agent's LLM is not functional" —
+                # the swarm degrades (other agents still publish), but no
+                # coded/deterministic verdict stands in for the agent.
+                is_llm_unavailable = isinstance(exc, AgentUnavailableError)
+                reason = "llm_unavailable" if is_llm_unavailable else "agent_error"
                 self._publish_event(
                     req.id,
                     "agent_thought",
                     agent_id=agent_id,
                     payload={
                         "kind": "error",
+                        "reason": reason,
                         "agent_name": agent.name,
                         "message": f"Error durante la ejecución: {type(exc).__name__}: {exc}",
                     },
@@ -298,35 +308,22 @@ class InvestigationService:
                     req.id,
                     "agent_failed",
                     agent_id=agent_id,
-                    payload={"error": str(exc), "error_type": type(exc).__name__},
+                    payload={
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "reason": reason,
+                    },
                 )
                 self.audit.append(AuditLogEntry(
                     actor="system",
-                    action="auth.rejected",
+                    action="agent.unavailable" if is_llm_unavailable else "agent.failed",
                     target_entity_id=req.target_entity_id,
                     request_id=req.id,
-                    extra={"agent": agent_id, "error": str(exc)},
+                    extra={"agent": agent_id, "error": str(exc), "reason": reason},
                 ))
                 return agent_id, []
-            published = await self._publish_signals(agent, sigs, investigation_scope)
-            if published:
-                await _on_note(
-                    f"Conclusión: {len(published)} señal(es) publicadas con "
-                    f"confianza media={sum(s.confidence for s in published) / len(published):.2f}."
-                )
-            else:
-                await _on_note("Conclusión: sin señales que superen el umbral.")
-            self._publish_event(
-                req.id,
-                "agent_completed",
-                agent_id=agent_id,
-                payload={
-                    "agent_name": agent.name,
-                    "signals_emitted": len(published),
-                    "raw_signals": len(sigs),
-                },
-            )
-            return agent_id, published
+
+
 
         tasks = [asyncio.create_task(_wrap(aid)) for aid in agents]
         try:
@@ -413,6 +410,29 @@ class InvestigationService:
                 names = ", ".join(c.get("name", "?") for c in calls)
                 suffix = f" → herramientas: {names}"
             rendered = f"paso {(step or 0) + 1}: {first_line[:400]}{suffix}" if first_line else f"paso {(step or 0) + 1}{suffix}"
+        elif kind == "thinking":
+            # Chain-of-thought tokens from the thinking variant. Render
+            # each line as a separate thought so the UI can show the
+            # model's reasoning trace step-by-step instead of one giant
+            # block.
+            text = (payload.get("text") or "").strip()
+            if not text:
+                return
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                self._publish_event(
+                    request_id,
+                    "agent_thought",
+                    agent_id=agent_id,
+                    payload={
+                        "kind": "thinking",
+                        "agent_name": agent_name,
+                        "message": line[:600],
+                    },
+                )
+            return
         elif kind == "tool_invoked":
             tool = payload.get("tool")
             args = payload.get("args_redacted") or {}

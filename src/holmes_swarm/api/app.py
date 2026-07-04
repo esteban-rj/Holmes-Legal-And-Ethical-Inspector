@@ -18,7 +18,6 @@ from ..agents.whistleblower import WhistleblowerAgent
 from ..blackboard.queue_bus import QueueBus
 from ..config import Settings
 from ..data_sources.default_loader import make_default_data_loader
-from ..data_sources.secop import make_default_secop_source
 from ..investigations.audit import AuditLog
 from ..investigations.service import InvestigationService
 from ..llm.base import LLMClient
@@ -49,6 +48,9 @@ def build_app(*, config_path: str) -> FastAPI:
             api_base=settings.llm.api_base,
             model=settings.llm.model,
             api_key_env=settings.llm.api_key_env,
+            thinking=settings.llm.thinking,
+            thinking_model=settings.llm.thinking_model,
+            reasoning_effort=settings.llm.reasoning_effort,
         )
     else:
         llm = MockLLMClient()
@@ -71,17 +73,15 @@ def build_app(*, config_path: str) -> FastAPI:
     contracting_client = (
         _client_for(_contracting_cfg) if _contracting_cfg is not None else None
     )
-    secop_source = make_default_secop_source(http_client=contracting_client)
     if "contracting" in settings.agents:
         contracting = ContractingAgent(
             llm=llm,
             http_client=contracting_client,
             retriever=retriever,
-            secop_source=secop_source,
             explore_allowed_hosts=_explore_hosts("contracting"),
         )
     else:
-        contracting = ContractingAgent(llm=llm, secop_source=secop_source)
+        contracting = ContractingAgent(llm=llm)
 
     # ---- Logistics Agent ----
     logistics = (
@@ -166,19 +166,114 @@ def build_app(*, config_path: str) -> FastAPI:
     app.include_router(agents_routes.router)
     app.include_router(chat_routes.router)
 
-    # Static UI (chat + live agent progress)
-    from fastapi.staticfiles import StaticFiles
+    # Static UI (chat + live agent progress).
+    #
+    # The browser loves to cache `app.js` and `styles.css` aggressively, and
+    # every fix in those files is invisible until the user does a hard reload
+    # (Cmd+Shift+R). To make life easier we wrap the assets in a tiny router
+    # that emits `Cache-Control: no-store` AND lets the HTML reference each
+    # file with a `?v=<mtime>` cache-buster so a normal reload always picks
+    # up the latest bytes from disk.
+    from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+    from starlette.staticfiles import StaticFiles
+
     _ui_dir = Path(__file__).resolve().parent.parent / "ui"
     _ui_dir.mkdir(parents=True, exist_ok=True)
-    if any(_ui_dir.glob("*")):
-        app.mount("/ui", StaticFiles(directory=str(_ui_dir), html=True), name="ui")
+
+    _NO_CACHE = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+    @app.get("/ui/{asset:path}", include_in_schema=False)
+    def _ui_asset(asset: str):
+        # Resolve with a guard against path traversal (asset is provided by
+        # the URL, not the filesystem).
+        target = (_ui_dir / asset).resolve()
+        if _ui_dir.resolve() not in target.parents and target != _ui_dir.resolve():
+            from fastapi import HTTPException
+
+            raise HTTPException(404, "unknown asset")
+        if not target.exists() or target.is_dir():
+            from fastapi import HTTPException
+
+            raise HTTPException(404, "unknown asset")
+        if target.suffix == ".html":
+            body = target.read_text(encoding="utf-8")
+            # Inject a per-file mtime cache-buster into <link>/<script>
+            # references so the browser always re-fetches the new bytes.
+            import re
+
+            def _bust(match: re.Match[str]) -> str:
+                tag = match.group(1)
+                attr = match.group(2)
+                url = match.group(4)  # the /ui/... URL is group 4 (group 3 is the quote)
+                rel = url[len("/ui/"):] if url.startswith("/ui/") else url.lstrip("/")
+                file_path = (_ui_dir / rel).resolve()
+                if not file_path.exists() or _ui_dir not in file_path.parents:
+                    return match.group(0)
+                stamp = int(file_path.stat().st_mtime)
+                return f"{tag} {attr}={url}?v={stamp}"
+
+            body = re.sub(
+                r'(<link|<script)\s+(href|src)=(["\'])(/ui/[^"\']+)\3',
+                _bust,
+                body,
+            )
+            return HTMLResponse(body, headers=_NO_CACHE)
+        if target.suffix == ".js":
+            return PlainTextResponse(
+                target.read_text(encoding="utf-8"),
+                media_type="application/javascript",
+                headers=_NO_CACHE,
+            )
+        if target.suffix == ".css":
+            return PlainTextResponse(
+                target.read_text(encoding="utf-8"),
+                media_type="text/css",
+                headers=_NO_CACHE,
+            )
+        return FileResponse(str(target), headers=_NO_CACHE)
+
+    def _serve_index() -> HTMLResponse:
+        import re
+
+        index_path = _ui_dir / "index.html"
+        if not index_path.exists():
+            return HTMLResponse(
+                "<h1>UI not installed</h1>", status_code=500, headers=_NO_CACHE
+            )
+        body = index_path.read_text(encoding="utf-8")
+
+        def _bust(match: re.Match[str]) -> str:
+            prefix = match.group(1)
+            quote = match.group(2)
+            url = match.group(3)
+            # url is something like "/ui/styles.css"; resolve by dropping the
+            # leading "/ui/" prefix so it joins cleanly under _ui_dir.
+            rel = url[len("/ui/"):] if url.startswith("/ui/") else url.lstrip("/")
+            file_path = (_ui_dir / rel).resolve()
+            if not file_path.exists() or _ui_dir not in file_path.parents:
+                return match.group(0)
+            stamp = int(file_path.stat().st_mtime)
+            return f"{prefix}{quote}{url}?v={stamp}{quote}"
+
+        body = re.sub(
+            r'(<(?:link|script)[^>]*?(?:href|src)=)(["\'])(/ui/[^"\']+)\2',
+            _bust,
+            body,
+        )
+        return HTMLResponse(body, headers=_NO_CACHE)
+
+    @app.get("/ui", include_in_schema=False)
+    @app.get("/ui/", include_in_schema=False)
+    def _ui_root() -> HTMLResponse:
+        return _serve_index()
 
     @app.get("/", include_in_schema=False)
-    def index() -> FileResponse:
-        index_path = _ui_dir / "index.html"
-        if index_path.exists():
-            return FileResponse(str(index_path))
-        return FileResponse(str(_ui_dir))
+    def index() -> HTMLResponse:
+        return _serve_index()
 
     return app
 

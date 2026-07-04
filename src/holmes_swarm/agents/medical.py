@@ -2,12 +2,18 @@
 
 The LLM uses ``retriever_query`` to look up SOAT tariffs and clinical
 guidelines (Hermetic, no PHI egress — FR-022 spirit kept even though air-gap
-is no longer the global default). When the LLM declines to emit anything,
-the heuristic monthly-volume + specialty-mismatch check stands.
+is no longer the global default).
+
+The LLM is the only judge. If the LLM is unavailable or returns no verdict
+the agent raises :class:`AgentUnavailableError` — it MUST NOT silently fall
+back to a coded monthly-volume / specialty-mismatch heuristic. The formulas
+live inside the system prompt so the LLM can apply them explicitly when
+reasoning.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ..blackboard.schema import InvestigationScope, Signal
@@ -15,7 +21,9 @@ from ..llm.base import LLMClient, ToolSpec
 from ..rag.base import Retriever
 from ._runtime import make_signal, run_agent_loop
 from ._tools import retriever_query_tool
-from .base import AgentRuntimeContext
+from .base import AgentRuntimeContext, AgentUnavailableError
+
+_log = logging.getLogger(__name__)
 
 
 class MedicalAgent:
@@ -23,11 +31,6 @@ class MedicalAgent:
     name = "Clinical Coherence"
     signal_type = "clinical"
     confidence_threshold = 0.75
-
-    _MAX_MONTHLY_PROC: dict[str, int] = {
-        "cardiologia_intervencionista": 120,
-        "hemodinamia_pediatrica": 60,
-    }
 
     def __init__(
         self,
@@ -66,58 +69,7 @@ class MedicalAgent:
             )
         ]
 
-    # ---------- deterministic helpers ----------
-
-    async def _deterministic_fallback(self, batch: dict[str, Any], scope: Any) -> list[Signal]:
-        signals: list[Signal] = []
-        entity_id = batch.get("entity_id") or (
-            scope.target_entity_id if isinstance(scope, InvestigationScope) else None
-        )
-        if not entity_id:
-            return signals
-        records = batch.get("procedures", []) or []
-        specialty = (batch.get("specialty") or "").lower().replace(" ", "_")
-        by_code: dict[str, int] = {}
-        for r in records:
-            code = str(r.get("code", ""))
-            by_code[code] = by_code.get(code, 0) + 1
-        for code, n in by_code.items():
-            limit = self._MAX_MONTHLY_PROC.get(specialty)
-            if limit and n > limit:
-                confidence = min(0.99, 0.6 + 0.4 * (n - limit) / limit)
-                signals.append(
-                    make_signal(
-                        agent_id=self.id,
-                        signal_type=self.signal_type,
-                        entity_id=entity_id,
-                        confidence=confidence,
-                        evidence={
-                            "pattern": "implausible_volume",
-                            "procedure_code": code,
-                            "monthly_volume": n,
-                            "specialty": specialty,
-                            "tariff_source": "SOAT",
-                        },
-                        scope=scope,
-                        confidence_threshold=self.confidence_threshold,
-                    )
-                )
-        services = [str(s).lower() for s in (batch.get("services") or [])]
-        if "marcapasos" in [str(r.get("code", "")).lower() for r in records] and not any(
-            s in ("cirugia_cardiaca", "cirugía_cardíaca") for s in services
-        ):
-            signals.append(
-                make_signal(
-                    agent_id=self.id,
-                    signal_type=self.signal_type,
-                    entity_id=entity_id,
-                    confidence=0.85,
-                    evidence={"pattern": "specialty_mismatch", "code": "33206", "service": "marcapasos"},
-                    scope=scope,
-                    confidence_threshold=self.confidence_threshold,
-                )
-            )
-        return signals
+    # ---------- main entry point ----------
 
     async def run(
         self, batch: Any, *, scope: Any = None, ctx: AgentRuntimeContext | None = None
@@ -131,48 +83,69 @@ class MedicalAgent:
             return []
 
         llm = (ctx.llm if ctx else None) or self.llm
+        if llm is None:
+            raise AgentUnavailableError(
+                f"agent={self.id} has no LLM configured; cannot reason about clinical coherence"
+            )
+
         sink = getattr(ctx, "thought_sink", None) if ctx else None
-        if llm is not None:
-            try:
-                raw = await run_agent_loop(
-                    llm=llm,
-                    system_prompt=self.system_prompt(),
-                    tools=self.tools(),
-                    batch=batch,
-                    scope=scope,
-                    chat_fn=_llm_chat_factory(llm),
-                    ctx=ctx,
-                )
-            except Exception as exc:
-                if sink is not None:
+
+        try:
+            raw = await run_agent_loop(
+                llm=llm,
+                system_prompt=self.system_prompt(),
+                tools=self.tools(),
+                batch=batch,
+                scope=scope,
+                chat_fn=_llm_chat_factory(llm),
+                ctx=ctx,
+            )
+        except AgentUnavailableError:
+            raise
+        except Exception as exc:
+            _log.error(
+                "agent.unavailable",
+                extra={
+                    "agent": self.id,
+                    "model": getattr(llm, "active_model", None),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "reason": "llm_call_failed",
+                },
+            )
+            if sink is not None:
+                try:
                     await sink.emit(
-                        "note",
+                        "error",
                         {
+                            "agent": self.name,
+                            "reason": "llm_unavailable",
+                            "error_type": type(exc).__name__,
                             "message": (
-                                f"LLM no disponible ({type(exc).__name__}: {exc}); "
-                                "se aplicarán reglas deterministas (volumen mensual / "
-                                "especialidad)."
-                            )
+                                f"LLM no disponible ({type(exc).__name__}: {exc}). "
+                                "Sin LLM funcional no se emiten veredictos."
+                            ),
                         },
                     )
-                return await self._deterministic_fallback(batch, scope)
-            signals = _verdict_to_signals(
-                raw,
-                agent_id=self.id,
-                signal_type=self.signal_type,
-                scope=scope,
-                confidence_threshold=self.confidence_threshold,
-                entity_id_fallback=entity_id,
-            )
-            if signals:
-                return signals
-            if sink is not None:
-                await sink.emit(
-                    "note",
-                    {"message": "El LLM no emitió señales; se aplicarán reglas deterministas (volumen mensual / especialidad)."},
-                )
+                except Exception:
+                    pass
+            raise AgentUnavailableError(
+                f"medical agent: LLM call failed ({type(exc).__name__}): {exc}"
+            ) from exc
 
-        return await self._deterministic_fallback(batch, scope)
+        signals = _verdict_to_signals(
+            raw,
+            agent_id=self.id,
+            signal_type=self.signal_type,
+            scope=scope,
+            confidence_threshold=self.confidence_threshold,
+            entity_id_fallback=entity_id,
+        )
+        if not signals:
+            raise AgentUnavailableError(
+                f"medical agent: LLM returned no signals for entity={entity_id}"
+            )
+        return signals
 
     async def shutdown(self) -> None:
         return None

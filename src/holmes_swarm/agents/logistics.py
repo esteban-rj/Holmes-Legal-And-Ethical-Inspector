@@ -1,4 +1,4 @@
-"""LogisticsAgent (FR-005) — LLM-driven version.
+"""LogisticsAgent (FR-005) — LLM-driven.
 
 The LLM decides whether a pair of events violates physical feasibility. Its
 tool chest:
@@ -7,21 +7,25 @@ tool chest:
   haversine heuristic is not enough.
 - ``web_search`` when it wants to corroborate a hospital location.
 
-When the LLM returns no signals, the heuristic (haversine km /
-25 km/h urban speed + 15 minute floor) is the authoritative fall-through,
-preserving the SC-005 behavioural contract.
+The LLM is the only judge. If the LLM is unavailable or returns no verdict
+the agent raises :class:`AgentUnavailableError` — it MUST NOT silently fall
+back to a coded haversine heuristic. The haversine / 25 km/h formula is
+exposed inside the agent's system prompt so the LLM can apply it explicitly
+when reasoning.
 """
 
 from __future__ import annotations
 
-from math import asin, cos, radians, sin, sqrt
+import logging
 from typing import Any
 
 from ..blackboard.schema import InvestigationScope, Signal
 from ..llm.base import LLMClient, ToolSpec
 from ._runtime import make_signal, run_agent_loop
 from ._tools import fetch_url_tool, web_search_tool
-from .base import AgentRuntimeContext
+from .base import AgentRuntimeContext, AgentUnavailableError
+
+_log = logging.getLogger(__name__)
 
 
 class LogisticsAgent:
@@ -39,12 +43,10 @@ class LogisticsAgent:
         *,
         llm: LLMClient | None = None,
         http_client: Any | None = None,
-        distance_provider: Any | None = None,
         explore_allowed_hosts: tuple[str, ...] = (),
     ) -> None:
         self.llm = llm
         self.http = http_client
-        self._distance = distance_provider
         self._explore_allowed_hosts = tuple(explore_allowed_hosts)
 
     # ---------- LLM-facing surfaces ----------
@@ -77,75 +79,7 @@ class LogisticsAgent:
             )
         return out
 
-    # ---------- deterministic helpers ----------
-
-    @staticmethod
-    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        if not (lat1 and lat2 and lon1 and lon2):
-            return 0.0
-        R = 6371.0
-        dlat = radians(lat2 - lat1)
-        dlon = radians(lon2 - lon1)
-        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-        return 2 * R * asin(sqrt(a))
-
-    @staticmethod
-    def _event_pair_minutes(a: dict[str, Any], b: dict[str, Any]) -> float | None:
-        from datetime import datetime
-        ta, tb = a.get("ts"), b.get("ts")
-        if not (ta and tb):
-            return None
-        try:
-            if isinstance(ta, str):
-                ta = datetime.fromisoformat(ta.replace("Z", "+00:00"))
-            if isinstance(tb, str):
-                tb = datetime.fromisoformat(tb.replace("Z", "+00:00"))
-            return (tb - ta).total_seconds() / 60.0
-        except Exception:
-            return None
-
-    async def _deterministic_fallback(self, batch: dict[str, Any], scope: Any) -> list[Signal]:
-        signals: list[Signal] = []
-        entity_id = batch.get("entity_id") or (
-            scope.target_entity_id if isinstance(scope, InvestigationScope) else None
-        )
-        if not entity_id:
-            return signals
-        events = batch.get("events", []) or []
-        for i in range(len(events) - 1):
-            a, b = events[i], events[i + 1]
-            dt_min = self._event_pair_minutes(a, b)
-            if dt_min is None or dt_min <= 0:
-                continue
-            loc_a, loc_b = a.get("location") or {}, b.get("location") or {}
-            km = self._haversine_km(
-                float(loc_a.get("lat", 0)),
-                float(loc_a.get("lon", 0)),
-                float(loc_b.get("lat", 0)),
-                float(loc_b.get("lon", 0)),
-            ) or self._DEFAULT_DISTANCE_KM
-            min_required_min = max(self._MIN_FEASIBLE_MIN, (km / self._URBAN_KMH) * 60.0)
-            if dt_min < min_required_min * 0.5:
-                confidence = min(0.99, 0.6 + 0.4 * (1 - dt_min / min_required_min))
-                signals.append(
-                    make_signal(
-                        agent_id=self.id,
-                        signal_type=self.signal_type,
-                        entity_id=entity_id,
-                        confidence=confidence,
-                        evidence={
-                            "pattern": "impossible_movement",
-                            "from": a.get("location"),
-                            "to": b.get("location"),
-                            "distance_km": round(km, 2),
-                            "observed_minutes": round(dt_min, 2),
-                            "minimum_required_minutes": round(min_required_min, 2),
-                        },
-                        scope=scope,
-                        confidence_threshold=self.confidence_threshold,
-                    )
-                )
-        return signals
+    # ---------- main entry point ----------
 
     async def run(
         self, batch: Any, *, scope: Any = None, ctx: AgentRuntimeContext | None = None
@@ -159,44 +93,70 @@ class LogisticsAgent:
             return []
 
         llm = (ctx.llm if ctx else None) or self.llm
+        if llm is None:
+            raise AgentUnavailableError(
+                f"agent={self.id} has no LLM configured; cannot reason about movements"
+            )
+
         tools = self.tools()
         sink = getattr(ctx, "thought_sink", None) if ctx else None
 
-        if llm is not None:
-            try:
-                raw = await run_agent_loop(
-                    llm=llm,
-                    system_prompt=self.system_prompt(),
-                    tools=tools,
-                    batch=batch,
-                    scope=scope,
-                    chat_fn=_llm_chat_factory(llm),
-                    ctx=ctx,
-                )
-            except Exception as exc:
-                if sink is not None:
+        try:
+            raw = await run_agent_loop(
+                llm=llm,
+                system_prompt=self.system_prompt(),
+                tools=tools,
+                batch=batch,
+                scope=scope,
+                chat_fn=_llm_chat_factory(llm),
+                ctx=ctx,
+            )
+        except AgentUnavailableError:
+            raise
+        except Exception as exc:
+            _log.error(
+                "agent.unavailable",
+                extra={
+                    "agent": self.id,
+                    "model": getattr(llm, "active_model", None),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "reason": "llm_call_failed",
+                },
+            )
+            if sink is not None:
+                try:
                     await sink.emit(
-                        "note",
+                        "error",
                         {
+                            "agent": self.name,
+                            "reason": "llm_unavailable",
+                            "error_type": type(exc).__name__,
                             "message": (
-                                f"LLM no disponible ({type(exc).__name__}: {exc}); "
-                                "se aplicarán reglas deterministas (movimiento geo-temporal)."
-                            )
+                                f"LLM no disponible ({type(exc).__name__}: {exc}). "
+                                "Sin LLM funcional no se emiten veredictos."
+                            ),
                         },
                     )
-                return await self._deterministic_fallback(batch, scope)
-            signals = _verdict_to_signals(
-                raw,
-                agent_id=self.id,
-                signal_type=self.signal_type,
-                scope=scope,
-                confidence_threshold=self.confidence_threshold,
-                entity_id_fallback=entity_id,
-            )
-            if signals:
-                return signals
+                except Exception:
+                    pass
+            raise AgentUnavailableError(
+                f"logistics agent: LLM call failed ({type(exc).__name__}): {exc}"
+            ) from exc
 
-        return await self._deterministic_fallback(batch, scope)
+        signals = _verdict_to_signals(
+            raw,
+            agent_id=self.id,
+            signal_type=self.signal_type,
+            scope=scope,
+            confidence_threshold=self.confidence_threshold,
+            entity_id_fallback=entity_id,
+        )
+        if not signals:
+            raise AgentUnavailableError(
+                f"logistics agent: LLM returned no signals for entity={entity_id}"
+            )
+        return signals
 
     async def shutdown(self) -> None:
         if self.http is not None:

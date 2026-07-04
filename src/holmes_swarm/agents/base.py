@@ -32,6 +32,19 @@ from ..llm.base import LLMClient, ThoughtSink, ToolSpec
 from ..rag.base import Retriever
 
 
+class AgentUnavailableError(RuntimeError):
+    """Raised by an Agent when its reasoning backend (LLM) is unavailable
+    or returns no usable verdict.
+
+    Agents MUST NOT silently fall back to a coded / deterministic heuristic
+    on LLM failure: decisions in this swarm are made by a functional Agent,
+    not by hardcoded rules. The orchestrator catches this error, logs it,
+    surfaces a ``kind=error`` thought to the UI, and continues with the
+    remaining agents so signals produced by healthy agents remain on the
+    Blackboard under origin ``investigation:<request_id>``.
+    """
+
+
 @dataclass
 class AgentRuntimeContext:
     """Per-run context injected into every agent's `run()` call.

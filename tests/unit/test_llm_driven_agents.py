@@ -1,8 +1,11 @@
 """LLM-driven behaviour tests.
 
-These exercise the new code path where each agent *reasons* through the LLM
-(using a scripted `MockLLMClient`) and invokes tools under the allow-list,
-falling back to deterministic rules when the LLM emits no verdict.
+These exercise the contract that each agent *reasons* through the LLM
+(using a scripted `MockLLMClient`) and invokes tools under the allow-list.
+When the LLM is unavailable or returns no usable verdict, the agent MUST
+NOT fall back to a coded/deterministic heuristic — it MUST raise
+:class:`AgentUnavailableError`. Decisions belong to a functional agent, not
+hardcoded rules.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import pytest
 
 from holmes_swarm.agents._runtime import parse_verdict
 from holmes_swarm.agents._tools import fetch_url_tool, retriever_query_tool
-from holmes_swarm.agents.base import AgentRuntimeContext
+from holmes_swarm.agents.base import AgentRuntimeContext, AgentUnavailableError
 from holmes_swarm.agents.contracting import ContractingAgent
 from holmes_swarm.agents.logistics import LogisticsAgent
 from holmes_swarm.agents.medical import MedicalAgent
@@ -198,15 +201,62 @@ async def test_contracting_llm_path_emits_signal_from_verdict():
 
 
 @pytest.mark.asyncio
-async def test_contracting_falls_back_when_llm_noop():
+async def test_contracting_raises_agent_unavailable_when_llm_noop():
+    """When the LLM returns no signals the agent MUST raise — it MUST NOT
+    silently emit a coded SECOP verdict."""
     llm = MockLLMClient()  # empty queue -> returns [mock] no-op
     agent = ContractingAgent(llm=llm)
-    sigs = await agent.run(
-        {"entity_id": ENTITY, "contracts": [{"code": "93010", "price": 100_000}] * 3},
-        scope=None,
-    )
-    assert sigs, "fallback should emit at least one signal"
-    assert all(s.evidence.get("reasoning_source") != "llm" for s in sigs)
+    with pytest.raises(AgentUnavailableError):
+        await agent.run(
+            {"entity_id": ENTITY, "contracts": [{"code": "93010", "price": 100_000}] * 3},
+            scope=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_contracting_raises_agent_unavailable_when_llm_call_fails():
+    """A real LLM error (e.g. provider 400) MUST surface as AgentUnavailableError,
+    not be swallowed into a coded verdict."""
+
+    class _BoomLLM(MockLLMClient):
+        async def chat(self, messages, tools=(), **kwargs):  # type: ignore[override]
+            raise RuntimeError("HTTP 400 from provider")
+
+    agent = ContractingAgent(llm=_BoomLLM())
+    with pytest.raises(AgentUnavailableError):
+        await agent.run(
+            {"entity_id": ENTITY, "contracts": [{"code": "93010", "price": 100_000}] * 3},
+            scope=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_contracting_emits_error_thought_on_llm_failure():
+    """When the LLM fails the agent MUST also emit a ``kind=error`` thought
+    so the UI can surface the cause to the operator."""
+    thoughts: list[tuple[str, dict[str, Any]]] = []
+
+    class _Sink:
+        async def emit(self, kind: str, payload: dict[str, Any]) -> None:
+            thoughts.append((kind, payload))
+
+    class _BoomLLM(MockLLMClient):
+        async def chat(self, messages, tools=(), **kwargs):  # type: ignore[override]
+            raise RuntimeError("HTTP 400 from provider")
+
+    ctx = AgentRuntimeContext(llm=_BoomLLM(), thought_sink=_Sink())  # type: ignore[arg-type]
+    agent = ContractingAgent(llm=ctx.llm)
+    with pytest.raises(AgentUnavailableError):
+        await agent.run(
+            {"entity_id": ENTITY, "contracts": [{"code": "93010"}]},
+            scope=None,
+            ctx=ctx,
+        )
+    assert thoughts, "agent must emit at least one thought on failure"
+    kinds = [k for k, _ in thoughts]
+    assert "error" in kinds, f"expected kind=error thought, got {kinds}"
+    error_thoughts = [p for k, p in thoughts if k == "error"]
+    assert error_thoughts[0].get("reason") == "llm_unavailable"
 
 
 @pytest.mark.asyncio
@@ -243,21 +293,23 @@ async def test_contracting_can_call_secop_via_tool_allowed():
 
 
 @pytest.mark.asyncio
-async def test_logistics_llm_no_op_falls_back_to_heuristic():
+async def test_logistics_raises_agent_unavailable_when_llm_noop():
+    """LogisticsAgent MUST raise when the LLM emits no verdict; the haversine
+    / 25 km/h heuristic is exposed to the LLM via the system prompt, not
+    executed inline."""
     llm = MockLLMClient()
     agent = LogisticsAgent(llm=llm)
-    sigs = await agent.run(
-        {
-            "entity_id": ENTITY,
-            "events": [
-                {"ts": "2026-01-01T08:00:00Z", "location": {"lat": 4.6, "lon": -74.1}},
-                {"ts": "2026-01-01T08:05:00Z", "location": {"lat": 4.6, "lon": -74.1}},
-            ],
-        },
-        scope=None,
-    )
-    # Two events 5 minutes apart, same location -> gap < 0.5 * max(15, ...) -> signal
-    assert any(s.evidence.get("pattern") == "impossible_movement" for s in sigs)
+    with pytest.raises(AgentUnavailableError):
+        await agent.run(
+            {
+                "entity_id": ENTITY,
+                "events": [
+                    {"ts": "2026-01-01T08:00:00Z", "location": {"lat": 4.6, "lon": -74.1}},
+                    {"ts": "2026-01-01T08:05:00Z", "location": {"lat": 4.6, "lon": -74.1}},
+                ],
+            },
+            scope=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -300,19 +352,22 @@ async def test_medical_consults_retriever_then_emits():
 
 
 @pytest.mark.asyncio
-async def test_medical_no_llm_uses_heuristic_volume_threshold():
+async def test_medical_raises_agent_unavailable_when_llm_missing():
+    """MedicalAgent MUST raise when no LLM is configured — the monthly-volume
+    / specialty-mismatch heuristic is exposed to the LLM via the system
+    prompt, not executed inline."""
     retriever = FakeRetriever()
     agent = MedicalAgent(retriever=retriever)
-    sigs = await agent.run(
-        {
-            "entity_id": ENTITY,
-            "specialty": "cardiologia_intervencionista",
-            "procedures": [{"code": "93010"}] * 130,
-            "services": ["cirugia_cardiaca"],
-        },
-        scope=None,
-    )
-    assert any(s.evidence.get("pattern") == "implausible_volume" for s in sigs)
+    with pytest.raises(AgentUnavailableError):
+        await agent.run(
+            {
+                "entity_id": ENTITY,
+                "specialty": "cardiologia_intervencionista",
+                "procedures": [{"code": "93010"}] * 130,
+                "services": ["cirugia_cardiaca"],
+            },
+            scope=None,
+        )
 
 
 # ---------- Whistleblower ----------
@@ -341,13 +396,16 @@ async def test_whistleblower_sanitises_invented_modus_operandi():
 
 
 @pytest.mark.asyncio
-async def test_whistleblower_no_llm_regex_fallback():
+async def test_whistleblower_raises_agent_unavailable_when_no_llm():
+    """WhistleblowerAgent MUST raise when no LLM is configured; the
+    regex/modus-operandi allow-list is exposed to the LLM via system prompt,
+    not executed inline."""
     agent = WhistleblowerAgent()
-    sigs = await agent.run(
-        {"entity_id": ENTITY, "pqrs": [{"id": "PQR-X", "body": "pago por whatsapp, posible fraude"}]},
-        scope=None,
-    )
-    assert sigs, "regex fallback must still emit something"
+    with pytest.raises(AgentUnavailableError):
+        await agent.run(
+            {"entity_id": ENTITY, "pqrs": [{"id": "PQR-X", "body": "pago por whatsapp, posible fraude"}]},
+            scope=None,
+        )
 
 
 # ---------- Origin gating with LLM ----------
@@ -362,9 +420,15 @@ async def test_llm_verdict_respects_origin_via_InvestigationScope():
 
     from holmes_swarm.blackboard.schema import InvestigationScope
 
-    llm = _scripted([_verdict_json([
-        {"signal_type": "operational", "confidence": 0.7, "evidence": {"pattern": "pqr"}},
-    ])])
+    llm = _scripted([
+        ChatResponse(
+            text=json.dumps({
+                "sentiment": "negative",
+                "entities": [],
+                "modus_operandi": ["whatsapp"],
+            })
+        )
+    ])
     agent = WhistleblowerAgent(llm=llm)
     scope = InvestigationScope(
         investigation_request_id=uuid.uuid4(),
