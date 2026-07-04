@@ -67,6 +67,35 @@ function appendMessage(role, text, meta) {
   return div;
 }
 
+function verdictBadge(verdict) {
+  switch (String(verdict || '').toLowerCase()) {
+    case 'suspicious': return '🔴 sospechoso';
+    case 'inconclusive': return '🟡 inconcluso';
+    case 'no_findings': return '🟢 sin hallazgos';
+    default: return `⚪ ${verdict || 'inconcluso'}`;
+  }
+}
+
+function appendConclusion(agentId, agentName, payload) {
+  const wrap = document.createElement('div');
+  wrap.className = `msg bot conclusion agent-${agentSlug(agentId)}`;
+  const header = document.createElement('div');
+  header.className = 'conclusion-header';
+  const verdict = verdictBadge(payload.verdict);
+  const conf = typeof payload.confidence === 'number'
+    ? ` · confianza ${(payload.confidence * 100).toFixed(0)}%`
+    : '';
+  header.innerHTML = `<b>${escapeHtml(agentName || agentId)}</b> — <span class="verdict">${escapeHtml(verdict)}</span>${escapeHtml(conf)}`;
+  wrap.appendChild(header);
+  const body = document.createElement('div');
+  body.className = 'conclusion-body';
+  body.textContent = payload.summary || '(sin resumen)';
+  wrap.appendChild(body);
+  messagesEl.appendChild(wrap);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return wrap;
+}
+
 function appendEventLog(evt) {
   // Manage the per-agent filter tabs: every distinct agent_id seen on the
   // wire gets a tab with the agent's accent colour. Click to scope the log
@@ -400,6 +429,9 @@ function handleStreamEvent(evt) {
       runStateEl.textContent = 'completed';
       appendMessage('bot system', `Investigación finalizada: ${evt.payload.summary}`);
       refreshAlerts();
+      break;
+    case 'agent_conclusion':
+      appendConclusion(evt.agent_id, evt.payload.agent_name || evt.agent_id, evt.payload);
       break;
     case 'failed':
       setRunState('failed');

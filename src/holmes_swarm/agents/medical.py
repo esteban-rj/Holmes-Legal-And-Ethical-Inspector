@@ -19,7 +19,7 @@ from typing import Any
 from ..blackboard.schema import InvestigationScope, Signal
 from ..llm.base import LLMClient, ToolSpec
 from ..rag.base import Retriever
-from ._runtime import make_signal, run_agent_loop
+from ._runtime import emit_conclusion, make_signal, run_agent_loop
 from ._tools import retriever_query_tool
 from .base import AgentRuntimeContext, AgentUnavailableError
 
@@ -54,10 +54,13 @@ class MedicalAgent:
             "- procedure profile that is mismatched with the entity's "
             "registered service line.\n"
             "You MUST consult the local RAG knowledge base (SOAT / ISS "
-            "guidelines) via retriever_query before emitting a verdict.\n"
-            "Respond with JSON: {\"signals\":[{signal_type:'clinical', "
-            "confidence:[0,1], evidence:{pattern, procedure_code, "
-            "monthly_volume?, specialty?, service?, tariff_source}}]}."
+            "guidelines) via retriever_query before emitting a verdict.\n\n"
+            "When you have reached a final verdict, respond ONLY with JSON "
+            "matching {\"verdict\": 'suspicious'|'inconclusive'|'no_findings', "
+            "\"confidence\": float in [0,1], \"summary\": \"...\"}. The summary "
+            "is what the human will read in the chat — name the clinical "
+            "pattern, the procedure code, the specialty / service mismatch and "
+            "your final decision in <=100 words. Do not exceed 100 words."
         )
 
     def tools(self) -> list[ToolSpec]:
@@ -91,7 +94,7 @@ class MedicalAgent:
         sink = getattr(ctx, "thought_sink", None) if ctx else None
 
         try:
-            raw = await run_agent_loop(
+            raw, conclusion = await run_agent_loop(
                 llm=llm,
                 system_prompt=self.system_prompt(),
                 tools=self.tools(),
@@ -133,6 +136,7 @@ class MedicalAgent:
                 f"medical agent: LLM call failed ({type(exc).__name__}): {exc}"
             ) from exc
 
+        await emit_conclusion(sink, conclusion)
         signals = _verdict_to_signals(
             raw,
             agent_id=self.id,
@@ -142,9 +146,16 @@ class MedicalAgent:
             entity_id_fallback=entity_id,
         )
         if not signals:
-            raise AgentUnavailableError(
-                f"medical agent: LLM returned no signals for entity={entity_id}"
+            await emit_conclusion(
+                sink,
+                {
+                    "verdict": conclusion.get("verdict", "no_findings"),
+                    "confidence": conclusion.get("confidence", 0.0),
+                    "summary": conclusion.get("summary", "")
+                    or "No se identificaron patrones clínicos anómalos.",
+                },
             )
+            return []
         return signals
 
     async def shutdown(self) -> None:

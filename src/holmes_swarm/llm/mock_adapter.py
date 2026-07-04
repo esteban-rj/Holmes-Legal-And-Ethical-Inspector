@@ -92,7 +92,22 @@ class MockLLMClient:
                 else "neutral"
             )
             hits = [pat for pat in _MODUS_OPERANDI_PATTERNS if re.search(pat, prompt)]
-            payload = {"sentiment": sentiment, "entities": [], "modus_operandi": hits}
+            # Always emit the chat-shaped conclusion envelope plus the legacy
+            # sentiment/entities/modus_operandi fields so the agents can extract
+            # both the structured signal and the 100-word chat conclusion.
+            payload = {
+                "sentiment": sentiment,
+                "entities": [],
+                "modus_operandi": hits,
+                "verdict": "suspicious" if sentiment == "negative" and hits else (
+                    "inconclusive" if sentiment == "negative" else "no_findings"
+                ),
+                "confidence": 0.7 if sentiment == "negative" and hits else 0.3,
+                "summary": (
+                    "PQR con modus operandi del allow-list." if hits
+                    else "Sin patrones sospechosos en la PQR."
+                ),
+            }
             return ChatResponse(
                 text=_render(payload), raw={"mock": True, "payload": payload}
             )

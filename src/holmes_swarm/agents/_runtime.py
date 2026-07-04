@@ -3,10 +3,20 @@
 * `make_signal` — central Signal factory that always respects FR-031/FR-032
   origin rules. Replaces the bespoke `_make_signal` clones in each agent.
 * `user_batch_message` / `system_block` — small builders to keep prompts
-  consistent across agents.
+  consistent across agents. The system prompt injected via
+  ``user_batch_message`` ends with the conclusion JSON schema (``verdict`` /
+  ``confidence`` / ``summary`` ≤100 words) so each agent produces a chat-ready
+  conclusion in addition to its structured verdict.
+* `emit_conclusion` — helper agents use to forward the chat-shaped conclusion
+  to the UI through their thought sink. No-op when no sink is configured.
+* `parse_verdict` — legacy extractor for ``{"signals":[...]}`` envelopes.
+* `parse_conclusion` — extractor for ``{"verdict","confidence","summary"}``
+  conclusion envelopes. Always returns ``inconclusive`` on parse failure and
+  enforces the 100-word / 600-char ceiling on ``summary``.
 * `run_agent_loop` — convenience wrapper around `run_with_tool_loop` that
-  injects the agent's system prompt, parses the final JSON verdict, and
-  lets the agent fall back to deterministic rules if the LLM `no-op`s.
+  injects the agent's system prompt, parses the final JSON verdict and
+  conclusion, and lets the agent fall back to deterministic rules if the LLM
+  ``no-op``s.
 """
 
 from __future__ import annotations
@@ -63,6 +73,28 @@ def system_block(system_prompt: str) -> Message:
     return Message(role="system", content=system_prompt.strip())
 
 
+async def emit_conclusion(sink: ThoughtSink | None, conclusion: Mapping[str, Any]) -> None:
+    """Forward a parsed chat-conclusion to the UI via the agent's thought sink.
+
+    The InvestigationService watches the sink for ``kind='conclusion'`` events
+    and translates them into ``agent_conclusion`` SSE events so the chat pane
+    can render one bubble per agent. Silently no-ops when no sink is wired.
+    """
+    if sink is None:
+        return
+    payload = {
+        "kind": "conclusion",
+        "verdict": conclusion.get("verdict", "inconclusive"),
+        "confidence": conclusion.get("confidence", 0.0),
+        "summary": conclusion.get("summary", ""),
+    }
+    try:
+        await sink.emit("conclusion", payload)
+    except Exception:
+        # Never let a sink failure mask the agent's actual result.
+        pass
+
+
 def user_batch_message(*, system_prompt: str, batch: Any, scope: Any) -> list[Message]:
     """Initial message list: system + task description containing the batch.
 
@@ -89,13 +121,15 @@ def user_batch_message(*, system_prompt: str, batch: Any, scope: Any) -> list[Me
             "target_entity_id": getattr(scope, "target_entity_id", None),
         },
         "instructions": (
-            "Analyse the data and emit zero or more Signals. Respond with JSON "
-            "matching this schema: {\"signals\": [ {"
-            "\"signal_type\": <one of the allowed types>, "
+            "Analyse the data and conclude with a SHORT verdict for the chat. "
+            "Respond with STRICT JSON matching this schema: "
+            "{\"verdict\": <one of 'suspicious'|'inconclusive'|'no_findings'>, "
             "\"confidence\": float in [0,1], "
-            "\"evidence\": object }, ... ]}. "
-            "If you find no patterns, return {\"signals\": []}. "
-            "Use the declared tools when you need external or local reference data."
+            "\"summary\": <plain text, MAX 100 words / ~600 characters, written in Spanish, "
+            "stating your final verdict and the key evidence behind it>}. "
+            "The summary is what the human will read in the chat; be specific, "
+            "evidence-grounded and concise. Do not exceed 100 words. "
+            "Return ONLY the JSON object, no prose."
         ),
     }
     user = Message(
@@ -111,6 +145,37 @@ def user_batch_message(*, system_prompt: str, batch: Any, scope: Any) -> list[Me
 # ---------- verdict parsing ----------
 
 
+_ALLOWED_VERDICTS = {"suspicious", "inconclusive", "no_findings"}
+
+
+def _extract_json_object(text: str) -> Any:
+    """Best-effort JSON object extraction from an LLM reply.
+
+    Handles ```json fenced blocks and extra prose. Returns the parsed JSON
+    object/dict, or None if nothing usable was found.
+    """
+    import json
+    import re
+
+    if not text:
+        return None
+    fence = re.search(r"```(?:json)?\s*([\s\S]+?)```", text, re.IGNORECASE)
+    candidate = fence.group(1) if fence else text
+    body = "".join(candidate.splitlines())
+    for c in [body, text]:
+        try:
+            return json.loads(c)
+        except json.JSONDecodeError:
+            continue
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 def parse_verdict(text: str) -> list[dict[str, Any]]:
     """Extract a JSON `{"signals":[...]}` verdict from an LLM reply.
 
@@ -119,42 +184,43 @@ def parse_verdict(text: str) -> list[dict[str, Any]]:
     forget the wrapping `{"signals": [...]}` envelope) and to extra prose
     around the JSON object.
     """
-    import json
-    import re
-
-    if not text:
-        return []
-    # Try fenced block first.
-    fence = re.search(r"```(?:json)?\s*([\s\S]+?)```", text, re.IGNORECASE)
-    candidate = fence.group(1) if fence else text
-    candidates = [candidate.strip()]
-    for line in candidate.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("{") and stripped.endswith("}"):
-            candidates.append(stripped)
-    body = "".join(candidates[0].splitlines())
-    obj: Any = None
-    for c in [body, text]:
-        try:
-            obj = json.loads(c)
-            break
-        except json.JSONDecodeError:
-            continue
+    obj = _extract_json_object(text)
     if obj is None:
-        # Last-ditch: regex for the first balanced {...} blob.
-        m = re.search(r"\{[\s\S]*\}", text)
-        if not m:
-            return []
-        try:
-            obj = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return []
+        return []
     if isinstance(obj, list):
         return [s for s in obj if isinstance(s, dict)]
     if not isinstance(obj, dict):
         return []
     sigs = obj.get("signals")
     return [s for s in (sigs or []) if isinstance(s, dict)]
+
+
+def parse_conclusion(text: str) -> dict[str, Any]:
+    """Extract a `{"verdict","confidence","summary"}` conclusion from an LLM reply.
+
+    Falls back to `inconclusive` if the JSON cannot be parsed. The summary is
+    truncated to ~100 words (600 chars) to honour the contract the chat UI
+    relies on.
+    """
+    obj = _extract_json_object(text)
+    if not isinstance(obj, dict):
+        return {"verdict": "inconclusive", "confidence": 0.0, "summary": ""}
+    verdict = str(obj.get("verdict", "inconclusive")).strip().lower()
+    if verdict not in _ALLOWED_VERDICTS:
+        verdict = "inconclusive"
+    try:
+        confidence = float(obj.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    summary = str(obj.get("summary", "") or "").strip()
+    # Enforce the 100-word / 600-char ceiling. Keep whole words when possible.
+    if len(summary) > 600:
+        summary = summary[:600].rsplit(" ", 1)[0].rstrip()
+    words = summary.split()
+    if len(words) > 100:
+        summary = " ".join(words[:100]).rstrip()
+    return {"verdict": verdict, "confidence": confidence, "summary": summary}
 
 
 # ---------- agentic loop wrapper ----------
@@ -171,8 +237,15 @@ async def run_agent_loop(
     max_steps: int = 3,
     thought_sink: ThoughtSink | None = None,
     ctx: Any | None = None,  # AgentRuntimeContext — used as a fallback source of the sink
-) -> list[dict[str, Any]]:
-    """Convenience: build history, drive the tool loop, return the raw verdict signals (dicts).
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Convenience: build history, drive the tool loop.
+
+    Returns ``(signals_from_verdict, conclusion)``. ``signals_from_verdict``
+    is the legacy ``[{"signal_type":..., "confidence":..., "evidence":...}, ...]``
+    shape (kept for backwards compatibility with callers that still emit
+    signals onto the blackboard). ``conclusion`` is the new chat-shaped
+    dict ``{"verdict","confidence","summary"}`` used to render the per-agent
+    conclusion bubble in the chat pane.
 
     The thought sink resolution order:
     1. `thought_sink` arg (explicit override).
@@ -219,4 +292,6 @@ async def run_agent_loop(
             chat_fn=chat_fn,
             max_steps=max_steps,
         )
-    return parse_verdict(final.text)
+    signals = parse_verdict(final.text)
+    conclusion = parse_conclusion(final.text)
+    return signals, conclusion

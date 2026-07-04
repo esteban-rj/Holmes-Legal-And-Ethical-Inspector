@@ -4,7 +4,10 @@ System prompt enforces:
 
 - Treats the PQR text as confidential; ``body`` text is in the tool's redact
   list and MUST NOT be logged.
-- Output schema is strict JSON: sentiment, entities, modus_operandi.
+- Per-PQR output schema is strict JSON: sentiment, entities, modus_operandi.
+- The agent batches every PQR for the request and produces ONE short chat
+  conclusion describing the overall findings (verdict, confidence, ≤100-word
+  summary) which is forwarded to the chat pane via ``emit_conclusion``.
 - ``fetch_url`` is allowed only against the agent's allow-list (e.g. a
   moderation-API or a curated PQR-glossary host) and the LLM decides whether
   to consult it.
@@ -25,7 +28,7 @@ from typing import Any
 
 from ..blackboard.schema import InvestigationScope, Signal
 from ..llm.base import ChatResponse, LLMClient, Message, ToolSpec
-from ._runtime import make_signal
+from ._runtime import emit_conclusion, make_signal
 from ._tools import fetch_url_tool
 from .base import AgentRuntimeContext, AgentUnavailableError
 
@@ -112,6 +115,7 @@ class WhistleblowerAgent:
             )
         sink = getattr(ctx, "thought_sink", None) if ctx else None
 
+        per_pqr_verdicts: list[dict[str, Any]] = []
         for pqr in pqrs:
             text = pqr.get("body") or pqr.get("text") or ""
             entity_id = (
@@ -168,6 +172,7 @@ class WhistleblowerAgent:
                     f"whistleblower agent: LLM call failed ({type(exc).__name__}): {exc}"
                 ) from exc
 
+            per_pqr_verdicts.append({"pqr_id": pqr.get("id"), **verdict})
             modus = verdict.get("modus_operandi") or []
             if not modus:
                 # The LLM is the judge — an empty/unallow-listed modus_operandi
@@ -193,6 +198,13 @@ class WhistleblowerAgent:
                     confidence_threshold=self.confidence_threshold,
                 )
             )
+
+        # Build the chat conclusion summarising the batch. We ask the LLM once
+        # for a {verdict,confidence,summary} envelope; if the call fails we
+        # fall back to a deterministic rendering of the per-PQR results so
+        # the chat pane always sees a conclusion for this agent.
+        conclusion = await _summarise_pqrs(llm, per_pqr_verdicts)
+        await emit_conclusion(sink, conclusion)
         return signals
 
     async def shutdown(self) -> None:
@@ -275,3 +287,84 @@ async def _ask_llm_for_verdict(llm: LLMClient, system_prompt: str, body: str) ->
         "entities": [str(e) for e in (obj.get("entities") or []) if isinstance(e, (str, int))],
         "modus_operandi": _sanitise_modus(obj.get("modus_operandi")),
     }
+
+
+_CONCLUSION_SYSTEM = (
+    "You are drafting the final chat conclusion for a batch of PQR complaints "
+    "the whistleblower agent has just analysed. The per-PQR verdicts below were "
+    "decided by another LLM; your job is to summarise them into a single short "
+    "conclusion for a human reader.\n"
+    "Respond ONLY with JSON matching {\"verdict\": 'suspicious'|'inconclusive'"
+    "|'no_findings', \"confidence\": float in [0,1], \"summary\": \"...\"}. "
+    "The summary is what the human will read in the chat — name the dominant "
+    "modus operandi, the strongest evidence and your final decision. Do not "
+    "exceed 100 words."
+)
+
+
+async def _summarise_pqrs(llm: LLMClient, per_pqr_verdicts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Ask the LLM to turn the per-PQR verdicts into a chat conclusion.
+
+    Falls back to a deterministic, evidence-grounded summary if the LLM is
+    unavailable or returns unparseable JSON — never silently drops the chat
+    bubble for this agent.
+    """
+    from ._runtime import parse_conclusion
+
+    if not per_pqr_verdicts:
+        return {
+            "verdict": "no_findings",
+            "confidence": 0.0,
+            "summary": "No se recibieron PQR para analizar.",
+        }
+    try:
+        rendered = [
+            {
+                "pqr_id": v.get("pqr_id"),
+                "sentiment": v.get("sentiment"),
+                "entities": v.get("entities"),
+                "modus_operandi": v.get("modus_operandi"),
+            }
+            for v in per_pqr_verdicts
+        ]
+        resp: ChatResponse = await llm.chat(
+            messages=[
+                Message(role="system", content=_CONCLUSION_SYSTEM),
+                Message(
+                    role="user",
+                    content=(
+                        "Per-PQR verdicts (PHI-free rendering):\n"
+                        f"{json.dumps(rendered, ensure_ascii=False)}"
+                    ),
+                ),
+            ],
+            tools=[],
+        )
+        return parse_conclusion(resp.text)
+    except Exception as exc:
+        _log.warning(
+            "agent.whistleblower.conclusion_fallback",
+            extra={"reason": type(exc).__name__, "error": str(exc)},
+        )
+        # Deterministic fallback so the chat pane always gets a conclusion.
+        negative = [v for v in per_pqr_verdicts if v.get("sentiment") == "negative"]
+        modus = sorted({m for v in negative for m in (v.get("modus_operandi") or [])})
+        if negative and modus:
+            verdict = "suspicious"
+            conf = 0.7
+            summary = (
+                f"{len(negative)} PQR con sentiment negativo; modus operandi dominante: "
+                f"{', '.join(modus[:3])}. Se recomienda escalamiento al agente de consenso."
+            )
+        elif negative:
+            verdict = "inconclusive"
+            conf = 0.4
+            summary = (
+                f"{len(negative)} PQR con sentiment negativo pero sin modus operandi "
+                "explícito en el allow-list; requiere revisión humana."
+            )
+        else:
+            verdict = "no_findings"
+            conf = 0.0
+            summary = "Las PQR analizadas no muestran patrones sospechosos."
+        return {"verdict": verdict, "confidence": conf, "summary": summary}

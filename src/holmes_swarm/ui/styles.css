@@ -88,6 +88,21 @@ button.ghost:hover { background: var(--bg-3); }
 }
 .msg.bot.system { font-style: italic; color: var(--fg-muted); }
 .msg .meta { display: block; font-size: 11px; opacity: 0.7; margin-top: 4px; }
+.msg.bot.conclusion {
+  white-space: normal;
+  max-width: 82%;
+  border-left: 3px solid var(--accent);
+}
+.msg.bot.conclusion .conclusion-header {
+  font-size: 12px; opacity: 0.85; margin-bottom: 6px;
+  display: flex; flex-wrap: wrap; gap: 4px; align-items: baseline;
+}
+.msg.bot.conclusion .conclusion-header .verdict {
+  font-weight: 600;
+}
+.msg.bot.conclusion .conclusion-body {
+  font-size: 14px; line-height: 1.45; white-space: pre-wrap;
+}
 
 .composer {
   border-top: 1px solid var(--border);

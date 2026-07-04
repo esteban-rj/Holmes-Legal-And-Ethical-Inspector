@@ -21,7 +21,7 @@ from typing import Any
 
 from ..blackboard.schema import InvestigationScope, Signal
 from ..llm.base import LLMClient, ToolSpec
-from ._runtime import make_signal, run_agent_loop
+from ._runtime import emit_conclusion, make_signal, run_agent_loop
 from ._tools import fetch_url_tool, web_search_tool
 from .base import AgentRuntimeContext, AgentUnavailableError
 
@@ -62,10 +62,13 @@ class LogisticsAgent:
             "- Trigger a signal when observed gap < 0.5 * minimum_required_minutes.\n\n"
             "Tools: use fetch_url to call a routing API (OSRM, OpenRouteService) "
             "when location data is precise enough to be worth a remote query; "
-            "web_search otherwise. Emit a JSON verdict: "
-            "{\"signals\":[{signal_type:'physical', confidence:[0,1], "
-            "evidence:{pattern:'impossible_movement', from, to, "
-            "distance_km, observed_minutes, minimum_required_minutes}}]}."
+            "web_search otherwise.\n\n"
+            "When you have reached a final verdict, respond ONLY with JSON "
+            "matching {\"verdict\": 'suspicious'|'inconclusive'|'no_findings', "
+            "\"confidence\": float in [0,1], \"summary\": \"...\"}. The summary "
+            "is what the human will read in the chat — name the movement pair, "
+            "the distance, the observed vs minimum required minutes and your "
+            "final decision in <=100 words. Do not exceed 100 words."
         )
 
     def tools(self) -> list[ToolSpec]:
@@ -102,7 +105,7 @@ class LogisticsAgent:
         sink = getattr(ctx, "thought_sink", None) if ctx else None
 
         try:
-            raw = await run_agent_loop(
+            raw, conclusion = await run_agent_loop(
                 llm=llm,
                 system_prompt=self.system_prompt(),
                 tools=tools,
@@ -144,6 +147,7 @@ class LogisticsAgent:
                 f"logistics agent: LLM call failed ({type(exc).__name__}): {exc}"
             ) from exc
 
+        await emit_conclusion(sink, conclusion)
         signals = _verdict_to_signals(
             raw,
             agent_id=self.id,
@@ -153,9 +157,16 @@ class LogisticsAgent:
             entity_id_fallback=entity_id,
         )
         if not signals:
-            raise AgentUnavailableError(
-                f"logistics agent: LLM returned no signals for entity={entity_id}"
+            await emit_conclusion(
+                sink,
+                {
+                    "verdict": conclusion.get("verdict", "no_findings"),
+                    "confidence": conclusion.get("confidence", 0.0),
+                    "summary": conclusion.get("summary", "")
+                    or "No se identificaron movimientos físicamente imposibles.",
+                },
             )
+            return []
         return signals
 
     async def shutdown(self) -> None:

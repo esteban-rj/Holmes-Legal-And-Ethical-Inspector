@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from holmes_swarm.agents._runtime import parse_verdict
+from holmes_swarm.agents._runtime import parse_conclusion, parse_verdict
 from holmes_swarm.agents._tools import fetch_url_tool, retriever_query_tool
 from holmes_swarm.agents.base import AgentRuntimeContext, AgentUnavailableError
 from holmes_swarm.agents.contracting import ContractingAgent
@@ -84,9 +84,28 @@ def _scripted(responses: list[ChatResponse]) -> MockLLMClient:
     return MockLLMClient(scripted_responses=responses)
 
 
-def _verdict_json(signals: list[dict[str, Any]]) -> ChatResponse:
+def _verdict_json(
+    signals: list[dict[str, Any]],
+    verdict: str = "suspicious",
+    confidence: float = 0.0,
+    summary: str = "",
+) -> ChatResponse:
+    if not confidence:
+        if signals:
+            confidence = max(0.0, min(1.0, float(signals[0].get("confidence", 0.0))))
+        else:
+            confidence = 0.0
+    if not summary:
+        summary = f"Patrón detectado con {len(signals)} señal(es)."
     return ChatResponse(
-        text=json.dumps({"signals": signals}),
+        text=json.dumps(
+            {
+                "verdict": verdict,
+                "confidence": confidence,
+                "summary": summary,
+                "signals": signals,
+            }
+        ),
         raw={"mock": True},
     )
 
@@ -177,6 +196,28 @@ def test_parse_verdict_handles_fenced_blocks_and_no_signals():
     assert parse_verdict("plain text") == []
 
 
+def test_parse_conclusion_truncates_to_100_words_and_defaults():
+    short = parse_conclusion(
+        '{"verdict":"suspicious","confidence":0.9,'
+        '"summary":"movimientos imposibles entre dos hospitales."}'
+    )
+    assert short["verdict"] == "suspicious"
+    assert short["confidence"] == 0.9
+    assert "movimientos imposibles" in short["summary"]
+    long_text = "palabra " * 200
+    big = parse_conclusion(
+        f'{{"verdict":"suspicious","confidence":0.5,"summary":"{long_text}"}}'
+    )
+    assert len(big["summary"].split()) <= 100
+    # Invalid verdict -> inconclusive
+    fallback = parse_conclusion('{"verdict":"maybe","confidence":1.4,"summary":"x"}')
+    assert fallback["verdict"] == "inconclusive"
+    assert fallback["confidence"] == 1.0
+    # Garbage -> inconclusive empty summary
+    empty = parse_conclusion("not json at all")
+    assert empty == {"verdict": "inconclusive", "confidence": 0.0, "summary": ""}
+
+
 # ---------- Contracting ----------
 
 
@@ -201,16 +242,27 @@ async def test_contracting_llm_path_emits_signal_from_verdict():
 
 
 @pytest.mark.asyncio
-async def test_contracting_raises_agent_unavailable_when_llm_noop():
-    """When the LLM returns no signals the agent MUST raise — it MUST NOT
-    silently emit a coded SECOP verdict."""
+async def test_contracting_returns_no_signals_but_emits_inconclusive_conclusion():
+    """When the LLM returns no usable signal data the agent MUST NOT silently
+    emit a coded SECOP verdict. It returns no signals but still forwards an
+    "inconclusive" chat conclusion through its thought sink."""
     llm = MockLLMClient()  # empty queue -> returns [mock] no-op
+    thoughts: list[tuple[str, dict[str, Any]]] = []
+
+    class _Sink:
+        async def emit(self, kind: str, payload: dict[str, Any]) -> None:
+            thoughts.append((kind, payload))
+
     agent = ContractingAgent(llm=llm)
-    with pytest.raises(AgentUnavailableError):
-        await agent.run(
-            {"entity_id": ENTITY, "contracts": [{"code": "93010", "price": 100_000}] * 3},
-            scope=None,
-        )
+    sigs = await agent.run(
+        {"entity_id": ENTITY, "contracts": [{"code": "93010", "price": 100_000}] * 3},
+        scope=None,
+        ctx=AgentRuntimeContext(llm=llm, thought_sink=_Sink()),  # type: ignore[arg-type]
+    )
+    assert sigs == []
+    conclusions = [p for k, p in thoughts if k == "conclusion"]
+    assert conclusions, "agent must forward a chat conclusion"
+    assert conclusions[0]["verdict"] == "inconclusive"
 
 
 @pytest.mark.asyncio
@@ -293,23 +345,33 @@ async def test_contracting_can_call_secop_via_tool_allowed():
 
 
 @pytest.mark.asyncio
-async def test_logistics_raises_agent_unavailable_when_llm_noop():
-    """LogisticsAgent MUST raise when the LLM emits no verdict; the haversine
-    / 25 km/h heuristic is exposed to the LLM via the system prompt, not
-    executed inline."""
+async def test_logistics_returns_no_signals_but_emits_inconclusive_conclusion():
+    """LogisticsAgent MUST NOT silently fall back to the haversine heuristic
+    when the LLM emits nothing usable. It surfaces an "inconclusive" chat
+    conclusion instead."""
     llm = MockLLMClient()
+    thoughts: list[tuple[str, dict[str, Any]]] = []
+
+    class _Sink:
+        async def emit(self, kind: str, payload: dict[str, Any]) -> None:
+            thoughts.append((kind, payload))
+
     agent = LogisticsAgent(llm=llm)
-    with pytest.raises(AgentUnavailableError):
-        await agent.run(
-            {
-                "entity_id": ENTITY,
-                "events": [
-                    {"ts": "2026-01-01T08:00:00Z", "location": {"lat": 4.6, "lon": -74.1}},
-                    {"ts": "2026-01-01T08:05:00Z", "location": {"lat": 4.6, "lon": -74.1}},
-                ],
-            },
-            scope=None,
-        )
+    sigs = await agent.run(
+        {
+            "entity_id": ENTITY,
+            "events": [
+                {"ts": "2026-01-01T08:00:00Z", "location": {"lat": 4.6, "lon": -74.1}},
+                {"ts": "2026-01-01T08:05:00Z", "location": {"lat": 4.6, "lon": -74.1}},
+            ],
+        },
+        scope=None,
+        ctx=AgentRuntimeContext(llm=llm, thought_sink=_Sink()),  # type: ignore[arg-type]
+    )
+    assert sigs == []
+    conclusions = [p for k, p in thoughts if k == "conclusion"]
+    assert conclusions
+    assert conclusions[0]["verdict"] == "inconclusive"
 
 
 @pytest.mark.asyncio
@@ -370,19 +432,57 @@ async def test_medical_raises_agent_unavailable_when_llm_missing():
         )
 
 
+@pytest.mark.asyncio
+async def test_medical_returns_no_signals_but_emits_inconclusive_conclusion():
+    """MedicalAgent MUST NOT silently emit a coded monthly-volume verdict when
+    the LLM returns nothing usable; it forwards an "inconclusive" chat
+    conclusion through the thought sink instead."""
+    retriever = FakeRetriever()
+    llm = MockLLMClient()
+    thoughts: list[tuple[str, dict[str, Any]]] = []
+
+    class _Sink:
+        async def emit(self, kind: str, payload: dict[str, Any]) -> None:
+            thoughts.append((kind, payload))
+
+    agent = MedicalAgent(llm=llm, retriever=retriever)
+    sigs = await agent.run(
+        {
+            "entity_id": ENTITY,
+            "specialty": "cardiologia_intervencionista",
+            "procedures": [{"code": "93010"}] * 130,
+            "services": ["cirugia_cardiaca"],
+        },
+        scope=None,
+        ctx=AgentRuntimeContext(llm=llm, thought_sink=_Sink()),  # type: ignore[arg-type]
+    )
+    assert sigs == []
+    conclusions = [p for k, p in thoughts if k == "conclusion"]
+    assert conclusions
+    assert conclusions[0]["verdict"] == "inconclusive"
+
+
 # ---------- Whistleblower ----------
 
 
 @pytest.mark.asyncio
 async def test_whistleblower_sanitises_invented_modus_operandi():
     import json as _json
+    # First LLM call: per-PQR verdict. Second call: batch conclusion summary.
     llm = _scripted([
         ChatResponse(
             text=_json.dumps({
                 "sentiment": "negative", "entities": [],
                 "modus_operandi": ["whatsapp", "made_up_thing", "Telegram"],
             })
-        )
+        ),
+        ChatResponse(
+            text=_json.dumps({
+                "verdict": "suspicious",
+                "confidence": 0.7,
+                "summary": "PQR negativa con modus operandi WhatsApp en el allow-list.",
+            })
+        ),
     ])
     agent = WhistleblowerAgent(llm=llm)
     sigs = await agent.run(
@@ -427,7 +527,14 @@ async def test_llm_verdict_respects_origin_via_InvestigationScope():
                 "entities": [],
                 "modus_operandi": ["whatsapp"],
             })
-        )
+        ),
+        ChatResponse(
+            text=json.dumps({
+                "verdict": "suspicious",
+                "confidence": 0.7,
+                "summary": "PQR con modus WhatsApp.",
+            })
+        ),
     ])
     agent = WhistleblowerAgent(llm=llm)
     scope = InvestigationScope(

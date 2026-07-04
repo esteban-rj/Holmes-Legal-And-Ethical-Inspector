@@ -15,7 +15,13 @@ Progress events:
 - During `_run` the service publishes `ProgressEvent`s on an in-process pub/sub
   (`subscribe(request_id)`) so a UI can render per-agent status in real time.
 - Event kinds: `agent_started`, `agent_completed`, `agent_failed`, `signal`,
-  `state_changed`, `completed`, `failed`.
+  `agent_conclusion`, `state_changed`, `completed`, `failed`.
+
+Per-agent conclusions:
+- Each agent forwards its chat-shaped conclusion (verdict / confidence /
+  ≤100-word summary) through its `thought_sink`. The service translates
+  those into `agent_conclusion` SSE events so the chat pane can render one
+  bubble per agent.
 """
 
 from __future__ import annotations
@@ -45,7 +51,7 @@ class ProgressEvent:
     Serialisable to JSON for SSE transport. `payload` is the per-kind data.
     """
     request_id: uuid.UUID
-    # agent_started | agent_completed | agent_failed | signal | state_changed | completed | failed
+    # agent_started | agent_completed | agent_failed | signal | agent_conclusion | state_changed | completed | failed
     kind: str
     at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     agent_id: str | None = None
@@ -246,7 +252,10 @@ class InvestigationService:
             # Per-agent thought sink that forwards reasoning events to the SSE
             # stream. _publish_event appends each emission to the per-request
             # replay buffer so subscribers attaching after the agent starts
-            # still see the early thoughts.
+            # still see the early thoughts. The `conclusion` kind from
+            # `agents._runtime.emit_conclusion` is lifted into a top-level
+            # `agent_conclusion` event the UI can render directly as a chat
+            # bubble.
             thought_sink = ThoughtSink(
                 sink=lambda kind, payload: self._on_agent_thought(
                     req.id, agent_id, agent.name, kind, payload
@@ -258,14 +267,6 @@ class InvestigationService:
                 llm=self.llm,
                 thought_sink=thought_sink,
             )
-
-            async def _on_note(msg: str) -> None:
-                self._publish_event(
-                    req.id,
-                    "agent_thought",
-                    agent_id=agent_id,
-                    payload={"kind": "note", "agent_name": agent.name, "message": msg},
-                )
 
             try:
                 # Many agents will read ctx but ignore the tool loop; for those
@@ -323,7 +324,20 @@ class InvestigationService:
                 ))
                 return agent_id, []
 
-
+            # Publish signals onto the blackboard + emit one `signal` event
+            # per Signal so the side panel and consensus agent pick them up.
+            published = await self._publish_signals(agent, sigs, investigation_scope)
+            self._publish_event(
+                req.id,
+                "agent_completed",
+                agent_id=agent_id,
+                payload={
+                    "agent_name": agent.name,
+                    "signals_emitted": len(published),
+                    "raw_signals": len(sigs),
+                },
+            )
+            return agent_id, published
 
         tasks = [asyncio.create_task(_wrap(aid)) for aid in agents]
         try:
@@ -349,7 +363,9 @@ class InvestigationService:
         })
         self._close_subscribers(req.id)
 
-    async def _publish_signals(self, agent, signals: list[Signal], scope: InvestigationScope) -> list[Signal]:
+    async def _publish_signals(
+        self, agent, signals: list[Signal], scope: InvestigationScope
+    ) -> list[Signal]:
         published: list[Signal] = []
         for s in signals:
             s.origin = {"kind": "investigation", "investigation_request_id": str(scope.investigation_request_id)}
@@ -371,7 +387,6 @@ class InvestigationService:
                     },
                 )
             except PublishRejected:
-                # validation/dedup; skip but continue
                 pass
         return published
 
@@ -399,7 +414,24 @@ class InvestigationService:
         only need to translate the structured payload from `llm.base` into a
         single `agent_thought` ProgressEvent that the UI can render in a live
         feed per agent.
+
+        A ``kind="conclusion"`` thought (emitted by ``emit_conclusion`` in
+        ``agents._runtime``) is lifted into a top-level ``agent_conclusion``
+        ProgressEvent so the chat pane can render one bubble per agent.
         """
+        if kind == "conclusion":
+            self._publish_event(
+                request_id,
+                "agent_conclusion",
+                agent_id=agent_id,
+                payload={
+                    "agent_name": agent_name,
+                    "verdict": payload.get("verdict", "inconclusive"),
+                    "confidence": payload.get("confidence", 0.0),
+                    "summary": payload.get("summary", ""),
+                },
+            )
+            return
         if kind == "llm_step":
             step = payload.get("step")
             text = (payload.get("text") or "").strip()
