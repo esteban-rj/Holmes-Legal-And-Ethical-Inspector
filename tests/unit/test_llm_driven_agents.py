@@ -196,7 +196,7 @@ def test_parse_verdict_handles_fenced_blocks_and_no_signals():
     assert parse_verdict("plain text") == []
 
 
-def test_parse_conclusion_truncates_to_100_words_and_defaults():
+def test_parse_conclusion_does_not_truncate_and_defaults():
     short = parse_conclusion(
         '{"verdict":"suspicious","confidence":0.9,'
         '"summary":"movimientos imposibles entre dos hospitales."}'
@@ -208,7 +208,7 @@ def test_parse_conclusion_truncates_to_100_words_and_defaults():
     big = parse_conclusion(
         f'{{"verdict":"suspicious","confidence":0.5,"summary":"{long_text}"}}'
     )
-    assert len(big["summary"].split()) <= 100
+    assert len(big["summary"].split()) == 200
     # Invalid verdict -> inconclusive
     fallback = parse_conclusion('{"verdict":"maybe","confidence":1.4,"summary":"x"}')
     assert fallback["verdict"] == "inconclusive"
@@ -384,6 +384,59 @@ async def test_logistics_llm_path_uses_verdict():
     assert any(s.evidence.get("reasoning_source") == "llm" for s in sigs)
 
 
+@pytest.mark.asyncio
+async def test_logistics_web_search_uses_nominatim_not_duckduckgo():
+    """LogisticsAgent's web_search tool MUST hit Nominatim (already in the
+    agent's explore_allowed_hosts). Hitting DuckDuckGo would raise
+    BlockedHostError from the allow-list client and break the agent."""
+    http = FakeHttpClient()
+    http.set_response(
+        "nominatim",
+        body=json.dumps(
+            [
+                {
+                    "display_name": "Hospital San Ignacio, Bogotá, Colombia",
+                    "lat": "4.5981",
+                    "lon": "-74.0760",
+                    "url": "",
+                }
+            ]
+        ),
+    )
+    # First LLM turn: invoke web_search. Second turn: verdict (no findings).
+    search_call = ToolCall(
+        id="s1",
+        name="web_search",
+        arguments={"query": "Hospital San Ignacio Bogotá"},
+    )
+    llm = _scripted(
+        [
+            ChatResponse(text="", tool_calls=[search_call]),
+            _verdict_json([], verdict="inconclusive", summary="Sin hallazgos."),
+        ]
+    )
+    agent = LogisticsAgent(
+        llm=llm,
+        http_client=http,  # type: ignore[arg-type]
+        explore_allowed_hosts=(
+            r"^router\.project-osrm\.org$",
+            r"^api\.openrouteservice\.org$",
+            r"^nominatim\.openstreetmap\.org$",
+        ),
+    )
+    sigs = await agent.run({"entity_id": ENTITY, "events": []}, scope=None)
+    assert http.calls, "web_search must produce an outbound HTTP call"
+    assert any("nominatim.openstreetmap.org" in url for url in http.calls), (
+        f"expected Nominatim call, got: {http.calls}"
+    )
+    assert not any("duckduckgo.com" in url for url in http.calls), (
+        "DuckDuckGo MUST NOT be called from the logistics agent — it would "
+        "be blocked by the allow-list and raise BlockedHostError"
+    )
+    # No findings expected from the scripted verdict.
+    assert sigs == []
+
+
 # ---------- Medical ----------
 
 
@@ -555,6 +608,53 @@ def test_AgentRuntimeContext_carries_required_components():
     assert ctx.llm is not None
     assert ctx.explore_allowed_hosts == ()
     assert "body" in ctx.redact_arg_keys
+
+
+def test_unrestricted_web_bypasses_explore_allow_list_for_tools():
+    """When `unrestricted_web=True`, the agent should still expose
+    `fetch_url` / `web_search` even if `explore_allowed_hosts` is empty,
+    and the produced ToolSpec should accept any host (match-all regex).
+    """
+    from holmes_swarm.agents._tools import UNRESTRICTED_WEB_PATTERN
+
+    http = FakeHttpClient()
+    # Default (no unrestricted_web, no explore hosts): no web tools.
+    agent = ContractingAgent(llm=MockLLMClient(), http_client=http, retriever=None)
+    assert all(t.name not in {"web_search", "fetch_url"} for t in agent.tools())
+
+    # unrestricted_web=True, no explore hosts: tools exposed with the
+    # match-all pattern.
+    agent = ContractingAgent(
+        llm=MockLLMClient(), http_client=http, retriever=None, unrestricted_web=True
+    )
+    tool_names = {t.name for t in agent.tools()}
+    assert {"web_search", "fetch_url"} <= tool_names
+    fetch = next(t for t in agent.tools() if t.name == "fetch_url")
+    assert fetch.allowed_host_patterns == UNRESTRICTED_WEB_PATTERN
+    assert list(fetch.allowed_host_patterns) == [r"^.+$"]
+
+
+def test_unrestricted_web_only_affects_explore_tools_not_outbound_client():
+    """`unrestricted_web` must NOT widen the outbound httpx client's own
+    allow-list (that's a separate, transport-level layer in
+    `make_allowlisted_client`). The flag is consumed only by `tools()`.
+    """
+    from holmes_swarm.agents._tools import UNRESTRICTED_WEB_PATTERN
+
+    http = FakeHttpClient()
+    agent = ContractingAgent(
+        llm=MockLLMClient(),
+        http_client=http,
+        retriever=None,
+        explore_allowed_hosts=(r"^api\.secop\.gov\.co$",),
+        unrestricted_web=True,
+    )
+    # The web tools now match any host…
+    fetch = next(t for t in agent.tools() if t.name == "fetch_url")
+    assert fetch.allowed_host_patterns == UNRESTRICTED_WEB_PATTERN
+    # …but the agent's explore_allowed_hosts (which is the wiring surface
+    # to the outbound client) is unchanged.
+    assert agent._explore_allowed_hosts == (r"^api\.secop\.gov\.co$",)
 
 
 # Sanity: the type-ignore Comment "# type: ignore[arg-type]" on FakeHttpClient is intentional

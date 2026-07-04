@@ -21,6 +21,7 @@ agents:
         - "^secoop(?:\\..*)?$"
         - "^api\\.secop\\.gov\\.co$"
         - "^www\\.datos\\.gov\\.co$"
+      unrestricted_web: true 
   logistics:
     enabled: true
     confidence_threshold: 0.6

@@ -22,7 +22,12 @@ from ..blackboard.schema import InvestigationScope, Signal
 from ..data_sources.secop import SECOPSource
 from ..llm.base import LLMClient, ToolSpec
 from ._runtime import emit_conclusion, make_signal, run_agent_loop
-from ._tools import fetch_url_tool, retriever_query_tool, web_search_tool
+from ._tools import (
+    UNRESTRICTED_WEB_PATTERN,
+    fetch_url_tool,
+    retriever_query_tool,
+    web_search_tool,
+)
 from .base import AgentRuntimeContext, AgentUnavailableError
 
 _log = logging.getLogger(__name__)
@@ -41,6 +46,7 @@ class ContractingAgent:
         http_client: Any | None = None,
         retriever: Any | None = None,
         explore_allowed_hosts: tuple[str, ...] = (),
+        unrestricted_web: bool = False,
         # Legacy knobs — accepted but unused. The agent no longer executes
         # coded SECOP / reference-price rules inline; the LLM is the only
         # judge and reaches tariff data via retriever_query (RAG corpora).
@@ -53,6 +59,7 @@ class ContractingAgent:
         self.http = http_client
         self.retriever = retriever
         self._explore_allowed_hosts = tuple(explore_allowed_hosts)
+        self._unrestricted_web = bool(unrestricted_web)
         if secop_source is not None or reference_prices is not None:
             _log.warning(
                 "contracting.legacy_knobs_ignored",
@@ -79,20 +86,26 @@ class ContractingAgent:
             "fetch_url for live SECOP open data when needed.\n\n"
             "When you have reached a final verdict, respond ONLY with JSON "
             "matching {\"verdict\": 'suspicious'|'inconclusive'|'no_findings', "
-            "\"confidence\": float in [0,1], \"summary\": \"...\"}. The summary "
-            "is what the human will read in the chat — name the pattern, the "
-            "entity, the strongest evidence, and your final decision in <=100 "
-            "words. Do not exceed 100 words."
+            "\"confidence\": float in [0,1], \"summary\": \"<MUST be written in Spanish>\"}. "
+            "The summary is what the human will read in the chat — name the pattern, the "
+            "entity, the strongest evidence, and your final decision, always in Spanish. "
+            "Aim for around 100 words, but use more if the evidence requires it."
         )
 
     def tools(self) -> list[ToolSpec]:
         out: list[ToolSpec] = []
-        if self.http is not None and self._explore_allowed_hosts:
+        # The web tools require *some* allow-list to exist; when the agent
+        # has opted into `unrestricted_web` we substitute the match-all
+        # pattern so `execute_tool_calls` will accept any host.
+        patterns: tuple[str, ...] = (
+            UNRESTRICTED_WEB_PATTERN if self._unrestricted_web else self._explore_allowed_hosts
+        )
+        if self.http is not None and patterns:
             out.append(
-                web_search_tool(http_client=self.http, allowed_host_patterns=self._explore_allowed_hosts)
+                web_search_tool(http_client=self.http, allowed_host_patterns=patterns)
             )
             out.append(
-                fetch_url_tool(http_client=self.http, allowed_host_patterns=self._explore_allowed_hosts)
+                fetch_url_tool(http_client=self.http, allowed_host_patterns=patterns)
             )
         if self.retriever is not None:
             out.append(
@@ -177,17 +190,8 @@ class ContractingAgent:
         if not signals:
             # The LLM reached a verdict (it produced a chat conclusion), so the
             # absence of structured signals is a benign "no_findings" outcome
-            # rather than an LLM failure. Surface it as such and let the
-            # investigation continue.
-            await emit_conclusion(
-                sink,
-                {
-                    "verdict": conclusion.get("verdict", "no_findings"),
-                    "confidence": conclusion.get("confidence", 0.0),
-                    "summary": conclusion.get("summary", "")
-                    or "No se identificaron patrones de contratación sospechosos.",
-                },
-            )
+            # rather than an LLM failure. The conclusion was already emitted
+            # above; just return empty signals and let the investigation continue.
             return []
         return signals
 

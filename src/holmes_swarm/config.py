@@ -97,12 +97,20 @@ class InternetProfile(BaseModel):
                      invoke via `fetch_url` / `web_search`. SEPARATE from
                      `allowed_hosts` so each can be audited independently.
                      Empty list = the LLM cannot make outbound calls.
+    `unrestricted_web`: when true, removes the `fetch_url` / `web_search`
+                     host allow-list for this agent (LLM may hit any host).
+                     The outbound httpx client (`allowed_hosts`) is
+                     unaffected, so this is a deliberate escape hatch for
+                     `fetch_url` / `web_search` only. Intended for trusted,
+                     non-production environments (debugging, demos). MUST
+                     remain false in any deployment subject to FR-019.
     """
 
     kind: Literal["none", "public_ro", "llm_only"] = "none"
     allowed_hosts: list[str] = Field(default_factory=list)
     llm_endpoint: str | None = None
     explore_allowed_hosts: list[str] = Field(default_factory=list)
+    unrestricted_web: bool = False
 
     @field_validator("llm_endpoint")
     @classmethod

@@ -57,10 +57,11 @@ class MedicalAgent:
             "guidelines) via retriever_query before emitting a verdict.\n\n"
             "When you have reached a final verdict, respond ONLY with JSON "
             "matching {\"verdict\": 'suspicious'|'inconclusive'|'no_findings', "
-            "\"confidence\": float in [0,1], \"summary\": \"...\"}. The summary "
-            "is what the human will read in the chat — name the clinical "
+            "\"confidence\": float in [0,1], \"summary\": \"<MUST be written in Spanish>\"}. "
+            "The summary is what the human will read in the chat — name the clinical "
             "pattern, the procedure code, the specialty / service mismatch and "
-            "your final decision in <=100 words. Do not exceed 100 words."
+            "your final decision, always in Spanish. Aim for around 100 words, "
+            "but use more if the evidence requires it."
         )
 
     def tools(self) -> list[ToolSpec]:
@@ -146,15 +147,6 @@ class MedicalAgent:
             entity_id_fallback=entity_id,
         )
         if not signals:
-            await emit_conclusion(
-                sink,
-                {
-                    "verdict": conclusion.get("verdict", "no_findings"),
-                    "confidence": conclusion.get("confidence", 0.0),
-                    "summary": conclusion.get("summary", "")
-                    or "No se identificaron patrones clínicos anómalos.",
-                },
-            )
             return []
         return signals
 

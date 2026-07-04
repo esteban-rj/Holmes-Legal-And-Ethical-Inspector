@@ -121,14 +121,15 @@ def user_batch_message(*, system_prompt: str, batch: Any, scope: Any) -> list[Me
             "target_entity_id": getattr(scope, "target_entity_id", None),
         },
         "instructions": (
-            "Analyse the data and conclude with a SHORT verdict for the chat. "
+            "Analyse the data and conclude with a verdict for the chat. "
             "Respond with STRICT JSON matching this schema: "
             "{\"verdict\": <one of 'suspicious'|'inconclusive'|'no_findings'>, "
             "\"confidence\": float in [0,1], "
-            "\"summary\": <plain text, MAX 100 words / ~600 characters, written in Spanish, "
-            "stating your final verdict and the key evidence behind it>}. "
-            "The summary is what the human will read in the chat; be specific, "
-            "evidence-grounded and concise. Do not exceed 100 words. "
+            "\"summary\": <plain text, MUST be written in Spanish, stating your final "
+            "verdict and the key evidence behind it>}. "
+            "The summary is what the human will read in the chat; be specific "
+            "and evidence-grounded. Aim for around 100 words, but you may use "
+            "more if the evidence requires it. "
             "Return ONLY the JSON object, no prose."
         ),
     }
@@ -214,12 +215,6 @@ def parse_conclusion(text: str) -> dict[str, Any]:
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence))
     summary = str(obj.get("summary", "") or "").strip()
-    # Enforce the 100-word / 600-char ceiling. Keep whole words when possible.
-    if len(summary) > 600:
-        summary = summary[:600].rsplit(" ", 1)[0].rstrip()
-    words = summary.split()
-    if len(words) > 100:
-        summary = " ".join(words[:100]).rstrip()
     return {"verdict": verdict, "confidence": confidence, "summary": summary}
 
 

@@ -18,14 +18,31 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from ..blackboard.schema import InvestigationScope, Signal
 from ..llm.base import LLMClient, ToolSpec
 from ._runtime import emit_conclusion, make_signal, run_agent_loop
-from ._tools import fetch_url_tool, web_search_tool
+from ._tools import UNRESTRICTED_WEB_PATTERN, fetch_url_tool, web_search_tool
 from .base import AgentRuntimeContext, AgentUnavailableError
 
 _log = logging.getLogger(__name__)
+
+
+def _nominatim_search_url(query: str) -> str:
+    """Build a Nominatim ``/search`` URL for a free-form place query.
+
+    Nominatim is the OpenStreetMap geocoder; ``nominatim.openstreetmap.org``
+    is already in this agent's ``explore_allowed_hosts``, so the resulting
+    URL passes the allow-list (no ``BlockedHostError``). The endpoint
+    returns JSON, which ``web_search_tool`` parses into ``{title, url}``
+    entries pointing back at the same host so the LLM can ``fetch_url``
+    individual results if it needs more detail.
+    """
+    return (
+        "https://nominatim.openstreetmap.org/search?"
+        f"q={quote(query)}&format=json&addressdetails=1&limit=5"
+    )
 
 
 class LogisticsAgent:
@@ -44,10 +61,12 @@ class LogisticsAgent:
         llm: LLMClient | None = None,
         http_client: Any | None = None,
         explore_allowed_hosts: tuple[str, ...] = (),
+        unrestricted_web: bool = False,
     ) -> None:
         self.llm = llm
         self.http = http_client
         self._explore_allowed_hosts = tuple(explore_allowed_hosts)
+        self._unrestricted_web = bool(unrestricted_web)
 
     # ---------- LLM-facing surfaces ----------
 
@@ -62,23 +81,32 @@ class LogisticsAgent:
             "- Trigger a signal when observed gap < 0.5 * minimum_required_minutes.\n\n"
             "Tools: use fetch_url to call a routing API (OSRM, OpenRouteService) "
             "when location data is precise enough to be worth a remote query; "
-            "web_search otherwise.\n\n"
+            "use web_search to geocode a place name via Nominatim "
+            "(e.g. a hospital name) when only textual addresses are available.\n\n"
             "When you have reached a final verdict, respond ONLY with JSON "
             "matching {\"verdict\": 'suspicious'|'inconclusive'|'no_findings', "
-            "\"confidence\": float in [0,1], \"summary\": \"...\"}. The summary "
-            "is what the human will read in the chat — name the movement pair, "
+            "\"confidence\": float in [0,1], \"summary\": \"<MUST be written in Spanish>\"}. "
+            "The summary is what the human will read in the chat — name the movement pair, "
             "the distance, the observed vs minimum required minutes and your "
-            "final decision in <=100 words. Do not exceed 100 words."
+            "final decision, always in Spanish. Aim for around 100 words, but "
+            "use more if the evidence requires it."
         )
 
     def tools(self) -> list[ToolSpec]:
         out: list[ToolSpec] = []
-        if self.http is not None and self._explore_allowed_hosts:
+        patterns: tuple[str, ...] = (
+            UNRESTRICTED_WEB_PATTERN if self._unrestricted_web else self._explore_allowed_hosts
+        )
+        if self.http is not None and patterns:
             out.append(
-                web_search_tool(http_client=self.http, allowed_host_patterns=self._explore_allowed_hosts)
+                web_search_tool(
+                    http_client=self.http,
+                    allowed_host_patterns=patterns,
+                    url_builder=_nominatim_search_url,
+                )
             )
             out.append(
-                fetch_url_tool(http_client=self.http, allowed_host_patterns=self._explore_allowed_hosts)
+                fetch_url_tool(http_client=self.http, allowed_host_patterns=patterns)
             )
         return out
 
@@ -157,15 +185,6 @@ class LogisticsAgent:
             entity_id_fallback=entity_id,
         )
         if not signals:
-            await emit_conclusion(
-                sink,
-                {
-                    "verdict": conclusion.get("verdict", "no_findings"),
-                    "confidence": conclusion.get("confidence", 0.0),
-                    "summary": conclusion.get("summary", "")
-                    or "No se identificaron movimientos físicamente imposibles.",
-                },
-            )
             return []
         return signals
 

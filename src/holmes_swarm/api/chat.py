@@ -24,7 +24,7 @@ Given a Spanish (or mixed Spanish/English) investigation request, extract:
 - location: any geographic context (city, institution, subred, ESE, etc.).
 - procedure: any medical procedure, contract type, or clinical context.
 - date_from / date_to: any date range if mentioned (ISO yyyy-mm-dd).
-- narrative: a 1-sentence summary of the user's concern.
+- narrative: a 1-sentence summary of the user's concern, MUST be written in Spanish.
 - agents: which agents to run. Allowed ids are: contracting, logistics, medical, whistleblower. Default = all four if the user does not specify.
 
 Respond ONLY with a single JSON object. No prose. Example:

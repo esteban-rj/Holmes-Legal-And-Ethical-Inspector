@@ -27,6 +27,11 @@ agents:
         - "^secoop(?:\\..*)?$"
         - "^api\\.secop\\.gov\\.co$"
         - "^www\\.datos\\.gov\\.co$"
+      # Set to `true` to remove the fetch_url / web_search host allow-list
+      # for this agent (LLM may hit ANY host). Off by default — leaving
+      # FR-019 ("no unrestricted internet") in force. Intended for trusted,
+      # non-production environments (demos, local debugging).
+      unrestricted_web: false
   logistics:
     enabled: true
     confidence_threshold: 0.6
@@ -39,6 +44,7 @@ agents:
         - "^router\\.project-osrm\\.org$"
         - "^api\\.openrouteservice\\.org$"
         - "^nominatim\\.openstreetmap\\.org$"
+      unrestricted_web: false
   medical:
     enabled: true
     confidence_threshold: 0.75
@@ -47,6 +53,7 @@ agents:
       # empty explore_allowed_hosts => LLM cannot make outbound calls,
       # only consult the local RAG knowledge base.
       explore_allowed_hosts: []
+      unrestricted_web: false
   whistleblower:
     enabled: true
     confidence_threshold: 0.6

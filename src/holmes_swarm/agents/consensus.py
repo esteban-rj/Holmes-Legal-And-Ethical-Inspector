@@ -60,7 +60,8 @@ class ConsensusAgent:
             "by origin gating. Draft a CONCISE, EVIDENCE-GROUNDED summary of "
             "the fraud pattern they describe. Length: 1-2 sentences. Be "
             "specific: name the pattern, the entity, and the strongest "
-            "evidence. Do not speculate beyond the signals you were given."
+            "evidence. The summary MUST be written in Spanish. "
+            "Do not speculate beyond the signals you were given."
         )
 
     def tools(self) -> list[ToolSpec]:

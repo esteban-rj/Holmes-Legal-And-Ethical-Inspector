@@ -21,6 +21,15 @@ import httpx
 from ..llm.base import ToolSpec
 
 
+# Used as the allow-list for fetch_url / web_search when an agent opts into
+# `unrestricted_web: true` in its InternetProfile. Re.match with this pattern
+# matches any non-empty host, so the host check in `execute_tool_calls` is
+# effectively bypassed for that tool only. Note: the outbound httpx client's
+# own `allowed_hosts` event-hook is a separate layer; setting
+# `unrestricted_web` does NOT widen that.
+UNRESTRICTED_WEB_PATTERN: tuple[str, ...] = (r"^.+$",)
+
+
 def _http_tool(
     name: str,
     description: str,
@@ -84,20 +93,50 @@ def fetch_url_tool(
 
 
 def web_search_tool(
-    *, http_client: httpx.AsyncClient, allowed_host_patterns: Sequence[str]
+    *,
+    http_client: httpx.AsyncClient,
+    allowed_host_patterns: Sequence[str],
+    url_builder=None,
 ) -> ToolSpec:
-    """Run a search via an allow-listed search provider (default: open search engines
-    reachable through the allow-list). Returns a list of {title, url} dicts."""
+    """Run a search via an allow-listed search provider.
+
+    `url_builder` is an optional callable ``(query: str) -> str`` that builds
+    the search URL. When omitted the tool falls back to DuckDuckGo's HTML
+    endpoint (which requires ``duckduckgo.com`` in ``allowed_host_patterns``).
+    Agents whose allow-list only contains domain-specific APIs (e.g. the
+    logistics agent, allow-listed for OSRM / OpenRouteService / Nominatim)
+    should pass a ``url_builder`` that targets one of their allowed hosts —
+    Nominatim's ``/search`` endpoint is a good fit for geocoding lookups.
+    """
 
     async def _handler(args: dict[str, Any]) -> list[dict[str, Any]]:
         q = args["query"]
-        # Minimal HTML-DuckDuckGo-Lite fallback; in production swap for a proper
-        # provider behind the same allow-list.
-        url = f"https://duckduckgo.com/html/?q={httpx.QueryParams({'q': q})}"  # type: ignore[attr-defined]
+        if url_builder is not None:
+            url = url_builder(q)
+        else:
+            # Default DuckDuckGo fallback; callers MUST include duckduckgo.com
+            # in allowed_host_patterns or the request will be blocked.
+            url = f"https://duckduckgo.com/html/?q={httpx.QueryParams({'q': q})}"  # type: ignore[attr-defined]
         resp = await http_client.get(url, timeout=10.0, follow_redirects=True)
         resp.raise_for_status()
-        # We keep the response shape intentionally tiny; LLM can call fetch_url
-        # for a particular result it wants to read in full.
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, list):
+            results: list[dict[str, Any]] = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                results.append(
+                    {
+                        "title": item.get("display_name") or item.get("title") or "",
+                        "url": item.get("url") or "",
+                    }
+                )
+            return results[:5]
+        # Non-JSON responses (e.g. DuckDuckGo HTML): keep the original tiny
+        # shape so the LLM knows to call fetch_url for a specific result.
         return [
             {"query": q, "status": resp.status_code, "hint": "use fetch_url on a specific result"}
         ]

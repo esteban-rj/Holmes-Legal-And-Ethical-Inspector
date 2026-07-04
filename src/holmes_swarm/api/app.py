@@ -68,6 +68,12 @@ def build_app(*, config_path: str) -> FastAPI:
             return ()
         return tuple(cfg.internet_profile.explore_allowed_hosts or ())
 
+    def _unrestricted_web(agent_id: str) -> bool:
+        cfg = settings.agents.get(agent_id)
+        if cfg is None or cfg.internet_profile is None:
+            return False
+        return bool(cfg.internet_profile.unrestricted_web)
+
     # ---- Contracting Agent ----
     _contracting_cfg = settings.agents.get("contracting")
     contracting_client = (
@@ -79,6 +85,7 @@ def build_app(*, config_path: str) -> FastAPI:
             http_client=contracting_client,
             retriever=retriever,
             explore_allowed_hosts=_explore_hosts("contracting"),
+            unrestricted_web=_unrestricted_web("contracting"),
         )
     else:
         contracting = ContractingAgent(llm=llm)
@@ -89,6 +96,7 @@ def build_app(*, config_path: str) -> FastAPI:
             llm=llm,
             http_client=_client_for(settings.agents["logistics"]),
             explore_allowed_hosts=_explore_hosts("logistics"),
+            unrestricted_web=_unrestricted_web("logistics"),
         )
         if "logistics" in settings.agents
         else LogisticsAgent(llm=llm)
@@ -109,6 +117,11 @@ def build_app(*, config_path: str) -> FastAPI:
             _explore_hosts("whistleblower")
             if "whistleblower" in settings.agents
             else ()
+        ),
+        unrestricted_web=(
+            _unrestricted_web("whistleblower")
+            if "whistleblower" in settings.agents
+            else False
         ),
     )
 
