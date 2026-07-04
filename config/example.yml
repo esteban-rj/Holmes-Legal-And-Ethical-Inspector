@@ -1,0 +1,62 @@
+llm:
+  provider: mock          # change to "minimax" to use the real provider
+  model: MiniMax-M3
+  api_base: https://api.minimax.example/v1
+  api_key_env: MINIMAX_API_KEY
+
+agents:
+  contracting:
+    enabled: true
+    confidence_threshold: 0.7
+    internet_profile:
+      kind: public_ro
+      allowed_hosts:
+        - "^secoop(?:\\..*)?$"
+        - "^api\\.secop\\.gov\\.co$"
+      explore_allowed_hosts:
+        - "^secoop(?:\\..*)?$"
+        - "^api\\.secop\\.gov\\.co$"
+        - "^www\\.datos\\.gov\\.co$"
+  logistics:
+    enabled: true
+    confidence_threshold: 0.6
+    internet_profile:
+      kind: public_ro
+      allowed_hosts:
+        - "^router\\.project-osrm\\.org$"
+        - "^api\\.openrouteservice\\.org$"
+      explore_allowed_hosts:
+        - "^router\\.project-osrm\\.org$"
+        - "^api\\.openrouteservice\\.org$"
+        - "^nominatim\\.openstreetmap\\.org$"
+  medical:
+    enabled: true
+    confidence_threshold: 0.75
+    internet_profile:
+      kind: none
+      # empty explore_allowed_hosts => LLM cannot make outbound calls,
+      # only consult the local RAG knowledge base.
+      explore_allowed_hosts: []
+  whistleblower:
+    enabled: true
+    confidence_threshold: 0.6
+    internet_profile:
+      kind: llm_only
+      llm_endpoint: "${llm.api_base}"
+      explore_allowed_hosts:
+        - "^glossary\\.example\\.org$"
+
+blackboard:
+  dedup_window_seconds: 60
+  staleness_window_seconds: 86400
+
+investigations:
+  default_timeout_seconds: 300
+  consensus_evaluation_interval_seconds: 60
+  rate_limit_per_minute: 10
+
+auth:
+  tokens:
+    # demo token -> requester id mapping; replace in real deployments
+    "demo-token-esteban": "user:esteban"
+    "demo-token-auditor": "user:auditor"
