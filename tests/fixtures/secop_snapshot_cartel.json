@@ -1,0 +1,15 @@
+[
+  {"nit_entidad": "800555111-9", "codigo_proceso": "93010", "valor_total_del_contrato": 200000, "fecha_de_firma": "2025-08-15T00:00:00.000"},
+  {"nit_entidad": "800555111-9", "codigo_proceso": "93010", "valor_total_del_contrato": 195000, "fecha_de_firma": "2025-09-02T00:00:00.000"},
+  {"nit_entidad": "800555111-9", "codigo_proceso": "93010", "valor_total_del_contrato": 210000, "fecha_de_firma": "2025-09-22T00:00:00.000"},
+  {"nit_entidad": "800555111-9", "codigo_proceso": "93010", "valor_total_del_contrato": 205000, "fecha_de_firma": "2025-10-10T00:00:00.000"},
+  {"nit_entidad": "800555111-9", "codigo_proceso": "93010", "valor_total_del_contrato": 198000, "fecha_de_firma": "2025-10-29T00:00:00.000"},
+  {"nit_entidad": "800555111-9", "codigo_proceso": "93508", "valor_total_del_contrato": 480000,  "fecha_de_firma": "2025-09-12T00:00:00.000"},
+  {"nit_entidad": "800222333-1", "codigo_proceso": "93010", "valor_total_del_contrato": 1240000, "fecha_de_firma": "2025-08-20T00:00:00.000"},
+  {"nit_entidad": "800222333-1", "codigo_proceso": "93010", "valor_total_del_contrato": 1310000, "fecha_de_firma": "2025-09-18T00:00:00.000"},
+  {"nit_entidad": "800222333-1", "codigo_proceso": "93010", "valor_total_del_contrato": 1295000, "fecha_de_firma": "2025-10-12T00:00:00.000"},
+  {"nit_entidad": "800333444-2", "codigo_proceso": "93010", "valor_total_del_contrato": 1260000, "fecha_de_firma": "2025-09-05T00:00:00.000"},
+  {"nit_entidad": "800333444-2", "codigo_proceso": "93010", "valor_total_del_contrato": 1190000, "fecha_de_firma": "2025-10-01T00:00:00.000"},
+  {"nit_entidad": "800444555-3", "codigo_proceso": "93010", "valor_total_del_contrato": 1220000, "fecha_de_firma": "2025-09-22T00:00:00.000"},
+  {"nit_entidad": "800555111-9", "codigo_proceso": "93508", "valor_total_del_contrato": 4760000, "fecha_de_firma": "2025-09-25T00:00:00.000"}
+]

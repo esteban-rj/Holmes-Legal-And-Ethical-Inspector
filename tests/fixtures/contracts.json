@@ -1,0 +1,9 @@
+{
+  "entity_id": "900123456-7",
+  "contracts": [
+    {"code": "93010", "price": 200000, "platform": "SECOP"},
+    {"code": "93010", "price": 210000, "platform": "SECOP"},
+    {"code": "93010", "price": 220000, "platform": "SECOP"},
+    {"code": "93508", "price": 4800000, "platform": "SECOP"}
+  ]
+}

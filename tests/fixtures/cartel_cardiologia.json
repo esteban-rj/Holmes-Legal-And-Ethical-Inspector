@@ -1,0 +1,93 @@
+{
+  "case_id": "cartel-cardiologia-001",
+  "source": {
+    "video": "https://www.youtube.com/watch?v=3OUtY6J0i3A",
+    "context": "Bogotá 'Cartel de la Cardiología'. A councilman (concejal) reviewing public-health contracting detected a pattern: a single provider winning most hemodinamia/cateterismo contracts at sub-reference prices, providers logging impossibly short inter-procedure times, and an avalanche of PQRs mentioning WhatsApp/Telegram payments and 'facturas falsas'."
+  },
+  "entity": {
+    "id": "800555111-9",
+    "display_name": "CardioVital IPS (suspected)",
+    "specialty": "cardiologia_intervencionista",
+    "location": "Bogotá"
+  },
+  "contracts": [
+    {
+      "code": "93010",
+      "price": 200000,
+      "platform": "SECOP",
+      "contract_date": "2025-08-15",
+      "entity_id": "800555111-9"
+    },
+    {
+      "code": "93010",
+      "price": 195000,
+      "platform": "SECOP",
+      "contract_date": "2025-09-02",
+      "entity_id": "800555111-9"
+    },
+    {
+      "code": "93010",
+      "price": 210000,
+      "platform": "SECOP",
+      "contract_date": "2025-09-22",
+      "entity_id": "800555111-9"
+    },
+    {
+      "code": "93010",
+      "price": 205000,
+      "platform": "SECOP",
+      "contract_date": "2025-10-10",
+      "entity_id": "800555111-9"
+    },
+    {
+      "code": "93010",
+      "price": 198000,
+      "platform": "SECOP",
+      "contract_date": "2025-10-29",
+      "entity_id": "800555111-9"
+    },
+    {
+      "code": "93508",
+      "price": 480000,
+      "platform": "SECOP",
+      "contract_date": "2025-09-12",
+      "entity_id": "800555111-9"
+    }
+  ],
+  "events": [
+    {"ts": "2025-11-04T08:00:00+00:00", "location": {"lat": 4.7110, "lon": -74.0721}, "provider": "med-A"},
+    {"ts": "2025-11-04T08:07:00+00:00", "location": {"lat": 4.6530, "lon": -74.0830}, "provider": "med-A"},
+    {"ts": "2025-11-04T08:18:00+00:00", "location": {"lat": 4.5980, "lon": -74.0760}, "provider": "med-A"}
+  ],
+  "clinical": {
+    "specialty": "cardiologia_intervencionista",
+    "services": ["hemodinamia"],
+    "procedures": [
+      {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"},
+      {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"},
+      {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"},
+      {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"},
+      {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"},
+      {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"}, {"code": "93010"}
+    ]
+  },
+  "_procedures": "The cartel scenario implies *implausible monthly volume*. The agent's monthly cap for cardiologia_intervencionista is 120; we keep 30 in `clinical.procedures` here for compactness and augment the medical-agent batch via the data_loader with extra records (see _cartel_helpers.make_data_loader).",
+  "pqrs": [
+    {
+      "id": "PQR-001",
+      "entity_id": "800555111-9",
+      "text": "Me pidieron pagar la cuota por WhatsApp y me dieron una factura que parece falsa."
+    },
+    {
+      "id": "PQR-002",
+      "entity_id": "800555111-9",
+      "text": "Llegan auxiliares a captar pacientes al hospital y los remiten a la misma IPS por Telegram."
+    },
+    {
+      "id": "PQR-003",
+      "entity_id": "800555111-9",
+      "text": "Una señora en la sala me dijo que la comisiona la dan por whatsapp al médico."
+    }
+  ],
+  "_comment": "SECOP-shaped rows that mirror https://www.datos.gov.co/resource/rpmr-utcd.json. Generated for offline testing of the Contracting Agent's SECOP-fed reference-price check."
+}

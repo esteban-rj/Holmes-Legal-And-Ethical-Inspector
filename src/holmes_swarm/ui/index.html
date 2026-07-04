@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Holmes Swarm — Chat de Investigaciones</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">&#x1F50D;</span>
+      <h1>Holmes Swarm</h1>
+      <span class="tag">Investigaciones de fraude en salud</span>
+    </div>
+    <div class="topbar-right">
+      <label class="token-field">
+        <span>Token</span>
+        <input id="token" type="password" value="demo-token-esteban" autocomplete="off" />
+      </label>
+      <button id="refresh-agents" class="ghost" title="Recargar lista de agentes">Agentes</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="chat-pane">
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <form id="composer" class="composer" autocomplete="off">
+        <textarea
+          id="prompt"
+          rows="3"
+          placeholder="Ej: Encuentra movimientos alarmantes del Dr. Ciro Alfonso Gómez Meisel de la Clínica Meisel SAS en la SUBRED INTEGRADA DE SERVICIOS DE SALUD Norte y Sur"
+          required
+        ></textarea>
+        <div class="composer-actions">
+          <label class="checkbox">
+            <input id="auto-submit" type="checkbox" checked />
+            <span>Enviar y ejecutar agentes al instante</span>
+          </label>
+          <button type="submit" id="send-btn">Enviar</button>
+        </div>
+      </form>
+    </section>
+
+    <aside class="side-pane">
+      <section class="card">
+        <header><h2>Agentes</h2></header>
+        <ul id="agents-list" class="agents"></ul>
+      </section>
+
+      <section class="card" id="run-card" hidden>
+        <header>
+          <h2>Investigación</h2>
+          <span id="run-state" class="state-badge">—</span>
+        </header>
+        <div class="run-meta">
+          <div><span class="label">ID</span> <code id="run-id"></code></div>
+          <div><span class="label">Sujeto</span> <span id="run-target"></span></div>
+          <div><span class="label">Alcance</span> <span id="run-scope"></span></div>
+        </div>
+        <div class="agents-progress" id="agents-progress"></div>
+        <details class="signals-block" open>
+          <summary>Pensando en vivo</summary>
+          <div id="agent-thoughts" class="agent-thoughts"></div>
+        </details>
+        <details class="signals-block">
+          <summary>Señales (<span id="signal-count">0</span>)</summary>
+          <ol id="signals-list"></ol>
+        </details>
+        <details class="signals-block">
+          <summary>Alertas críticas (<span id="alert-count">0</span>)</summary>
+          <ol id="alerts-list"></ol>
+        </details>
+      </section>
+
+      <section class="card">
+        <header><h2>Eventos en vivo</h2></header>
+        <nav id="event-filter" class="event-filter" role="tablist" aria-label="Filtrar eventos por agente">
+          <button type="button" class="filter-pill active" data-filter="all">Todos</button>
+        </nav>
+        <ul id="event-log" class="event-log"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>
